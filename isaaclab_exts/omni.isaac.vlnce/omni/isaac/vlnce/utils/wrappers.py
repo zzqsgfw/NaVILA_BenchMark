@@ -9,7 +9,7 @@ The following example shows how to wrap an environment for RSL-RL:
 
 .. code-block:: python
 
-    from isaaclab_tasks.utils.wrappers.rsl_rl import RslRlVecEnvWrapper
+    from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
     env = RslRlVecEnvWrapper(env)
 
@@ -23,7 +23,7 @@ import numpy as np
 from rsl_rl.env import VecEnv
 
 from isaaclab.envs import DirectRLEnv, ManagerBasedRLEnv
-from isaaclab_tasks.utils.wrappers.rsl_rl import RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 from .measures import add_measurement
 

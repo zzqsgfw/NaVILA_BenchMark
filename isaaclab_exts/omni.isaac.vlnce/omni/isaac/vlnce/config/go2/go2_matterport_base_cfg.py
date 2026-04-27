@@ -29,7 +29,7 @@ import omni.isaac.vlnce.vlnce.mdp as mdp
 ##
 # Pre-defined configs
 ##
-from isaaclab_tasks.utils.wrappers.rsl_rl import (
+from isaaclab_rl.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
     RslRlPpoActorCriticCfg,
     RslRlPpoAlgorithmCfg,

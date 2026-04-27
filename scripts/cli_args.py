@@ -10,7 +10,7 @@ import argparse
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from isaaclab_tasks.utils.wrappers.rsl_rl import RslRlOnPolicyRunnerCfg
+    from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg
     from isaaclab.envs import ManagerBasedRLEnvCfg
 
 

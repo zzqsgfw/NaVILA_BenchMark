@@ -24,7 +24,7 @@ from isaaclab_assets import H1_MINIMAL_CFG  # isort: skip
 import omni.isaac.vlnce.vlnce.mdp as mdp
 from omni.isaac.vlnce.utils import ASSETS_DIR
 
-from isaaclab_tasks.utils.wrappers.rsl_rl import (
+from isaaclab_rl.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
     RslRlPpoActorCriticCfg,
     RslRlPpoAlgorithmCfg,

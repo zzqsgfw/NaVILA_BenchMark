@@ -69,7 +69,7 @@ from isaaclab.utils.io import load_yaml
 import isaaclab.utils.math as math_utils
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.utils import update_class_from_dict
-from isaaclab_tasks.utils.wrappers.rsl_rl import (
+from isaaclab_rl.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
     RslRlVecEnvWrapper,
 )

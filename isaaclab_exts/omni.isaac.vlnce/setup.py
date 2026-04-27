@@ -1,17 +1,13 @@
-"""Installation script for the 'omni.isaac.leggedloco' python package."""
+"""Installation script for the 'omni.isaac.vlnce' python package."""
 
+from setuptools import find_namespace_packages, setup
 
-from setuptools import setup
-
-# Minimum dependencies required prior to installation
 INSTALL_REQUIRES = [
-    # generic
     "numpy",
     "scipy>=1.7.1",
     "torch>=2.2.0",
 ]
 
-# Installation operation
 setup(
     name="omni-isaac-vlnce",
     version="0.0.1",
@@ -19,9 +15,7 @@ setup(
     include_package_data=True,
     python_requires=">=3.10",
     install_requires=INSTALL_REQUIRES,
-    packages=["omni.isaac.vlnce"],
-    classifiers=["Natural Language :: English", "Programming Language :: Python :: 3.10"],
+    packages=find_namespace_packages(include=["omni.isaac.vlnce", "omni.isaac.vlnce.*"]),
+    classifiers=["Natural Language :: English", "Programming Language :: Python :: 3.11"],
     zip_safe=False,
 )
-
-# EOF

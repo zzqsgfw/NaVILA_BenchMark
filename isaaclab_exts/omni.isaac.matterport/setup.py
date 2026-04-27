@@ -6,19 +6,15 @@
 
 """Installation script for the 'omni.isaac.matterport' python package."""
 
+from setuptools import find_namespace_packages, setup
 
-from setuptools import setup
-
-# Minimum dependencies required prior to installation
 INSTALL_REQUIRES = [
-    # generic
     "trimesh",
     "PyQt5",
     "matplotlib>=3.5.0",
     "pandas",
 ]
 
-# Installation operation
 setup(
     name="omni-isaac-matterport",
     author="Pascal Roth",
@@ -27,11 +23,9 @@ setup(
     description="Extension to include Matterport 3D Datasets into Isaac (taken from https://niessner.github.io/Matterport/).",
     keywords=["robotics"],
     include_package_data=True,
-    python_requires=">=3.7",
+    python_requires=">=3.10",
     install_requires=INSTALL_REQUIRES,
-    packages=["omni.isaac.matterport"],
-    classifiers=["Natural Language :: English", "Programming Language :: Python :: 3.7"],
+    packages=find_namespace_packages(include=["omni.isaac.matterport", "omni.isaac.matterport.*"]),
+    classifiers=["Natural Language :: English", "Programming Language :: Python :: 3.11"],
     zip_safe=False,
 )
-
-# EOF
