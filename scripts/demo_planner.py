@@ -37,7 +37,7 @@ simulation_app = app_launcher.app
 
 import isaacsim.core.utils.prims as prim_utils
 import torch
-from isaacsim.core.objects import VisualCuboid
+from isaacsim.core.api.objects import VisualCuboid
 
 import gymnasium as gym
 from isaaclab.sensors.camera.utils import create_pointcloud_from_depth

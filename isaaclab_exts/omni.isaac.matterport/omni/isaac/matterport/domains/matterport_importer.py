@@ -19,7 +19,7 @@ import isaacsim.core.utils.stage as stage_utils
 
 # isaac-lab
 import isaaclab.sim as sim_utils
-from isaacsim.core.simulation_context import SimulationContext
+from isaacsim.core.api.simulation_context import SimulationContext
 from isaaclab.terrains import TerrainImporter
 
 if TYPE_CHECKING:

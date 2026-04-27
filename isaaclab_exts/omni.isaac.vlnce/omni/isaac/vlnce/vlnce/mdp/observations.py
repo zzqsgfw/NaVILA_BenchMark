@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCaster
 from isaaclab.sensors.camera import CameraData
-from isaaclab.sensors.camera.utils import convert_orientation_convention
+from isaaclab.utils.math import convert_camera_frame_orientation_convention as convert_orientation_convention
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, RigidObject
 
