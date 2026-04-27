@@ -275,8 +275,18 @@ def main():
     else:
         env = RslRlVecEnvWrapper(env)
 
+    # Strip cfg keys that newer rsl-rl versions do not accept.
+    import inspect as _inspect
+    import rsl_rl as _rsl_rl
+    from rsl_rl.algorithms.ppo import PPO as _PPO
+    from isaaclab_rl.rsl_rl import handle_deprecated_rsl_rl_cfg
+    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, getattr(_rsl_rl, "__version__", "3.0.1"))
+    _ppo_kw = set(_inspect.signature(_PPO.__init__).parameters.keys()) | {"class_name"}
+    agent_cfg_dict = agent_cfg.to_dict()
+    agent_cfg_dict["algorithm"] = {k: v for k, v in agent_cfg_dict["algorithm"].items() if k in _ppo_kw}
+
     # load previously trained model
-    ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    ppo_runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=None, device=agent_cfg.device)
     ppo_runner.load(resume_path)
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)

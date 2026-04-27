@@ -76,11 +76,11 @@ class MatterportImporter(TerrainImporter):
         self.cfg = cfg
         self.device = SimulationContext.instance().device
 
-        # create a dict of meshes
-        self.meshes = dict()
-        self.warp_meshes = dict()
+        # buffers (mirroring TerrainImporter.__init__ since we bypass super().__init__)
+        self.terrain_prim_paths = list()
         self.env_origins = None
         self.terrain_origins = None
+        self._terrain_flat_patches = dict()
 
         # import the world
         if not self.cfg.terrain_type == "matterport":

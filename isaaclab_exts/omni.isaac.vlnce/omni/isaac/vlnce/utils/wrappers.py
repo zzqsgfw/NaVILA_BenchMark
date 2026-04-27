@@ -21,6 +21,7 @@ import torch
 import numpy as np
 
 from rsl_rl.env import VecEnv
+from tensordict import TensorDict
 
 from isaaclab.envs import DirectRLEnv, ManagerBasedRLEnv
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
@@ -54,13 +55,19 @@ class RslRlVecEnvHistoryWrapper(RslRlVecEnvWrapper):
         self.proprio_obs_dim = get_proprio_obs_dim(env)
         self.proprio_obs_buf = torch.zeros(self.num_envs, self.history_length, self.proprio_obs_dim,
                                                     dtype=torch.float, device=self.unwrapped.device)
-        
+
         self.clip_actions = 20.0
+
+    def _build_obs_td(self, obs_dict: dict, curr_obs: torch.Tensor) -> TensorDict:
+        """Bundle the policy tensor (with history) and the rest of the obs groups into a TensorDict."""
+        td_dict = dict(obs_dict)
+        td_dict["policy"] = curr_obs
+        return TensorDict(td_dict, batch_size=[self.num_envs])
 
     """
     Properties
     """
-    def get_observations(self) -> tuple[torch.Tensor, dict]:
+    def get_observations(self) -> TensorDict:
         """Returns the current observations of the environment."""
         if hasattr(self.unwrapped, "observation_manager"):
             obs_dict = self.unwrapped.observation_manager.compute()
@@ -70,11 +77,9 @@ class RslRlVecEnvHistoryWrapper(RslRlVecEnvWrapper):
         self.proprio_obs_buf = torch.cat([proprio_obs.unsqueeze(1)] * self.history_length, dim=1)
         proprio_obs_history = self.proprio_obs_buf.view(self.num_envs, -1)
         curr_obs = torch.cat([obs, proprio_obs_history], dim=1)
-        obs_dict["policy"] = curr_obs
+        return self._build_obs_td(obs_dict, curr_obs)
 
-        return curr_obs, {"observations": obs_dict}
-    
-    def reset(self) -> tuple[torch.Tensor, dict]:
+    def reset(self) -> tuple[TensorDict, dict]:
         """Resets the environment."""
         obs_dict, infos = self.env.reset()
         proprio_obs, obs = obs_dict["proprio"], obs_dict["policy"]
@@ -82,10 +87,9 @@ class RslRlVecEnvHistoryWrapper(RslRlVecEnvWrapper):
         proprio_obs_history = self.proprio_obs_buf.view(self.num_envs, -1)
         curr_obs = torch.cat([obs, proprio_obs_history], dim=1)
         infos["observations"] = obs_dict
+        return self._build_obs_td(obs_dict, curr_obs), infos
 
-        return curr_obs, infos
-
-    def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
         # clip the actions (for testing only)
         actions = torch.clamp(actions, -self.clip_actions, self.clip_actions)
 
@@ -95,8 +99,6 @@ class RslRlVecEnvHistoryWrapper(RslRlVecEnvWrapper):
         dones = (terminated | truncated).to(dtype=torch.long)
         # move extra observations to the extras dict
         proprio_obs, obs = obs_dict["proprio"], obs_dict["policy"]
-        # print("============== Height Map ==============")
-        # print(obs_dict["test_height_map"])
         extras["observations"] = obs_dict
         # move time out information to the extras dict
         # this is only needed for infinite horizon tasks
@@ -105,7 +107,7 @@ class RslRlVecEnvHistoryWrapper(RslRlVecEnvWrapper):
 
         # update obsservation history buffer & reset the history buffer for done environments
         self.proprio_obs_buf = torch.where(
-            (self.episode_length_buf < 1)[:, None, None], 
+            (self.episode_length_buf < 1)[:, None, None],
             torch.stack([torch.zeros_like(proprio_obs)] * self.history_length, dim=1),
             torch.cat([
                 self.proprio_obs_buf[:, 1:],
@@ -116,8 +118,7 @@ class RslRlVecEnvHistoryWrapper(RslRlVecEnvWrapper):
         curr_obs = torch.cat([obs, proprio_obs_history], dim=1)
         extras["observations"]["policy"] = curr_obs
 
-        # return the step information
-        return curr_obs, rew, dones, extras
+        return self._build_obs_td(obs_dict, curr_obs), rew, dones, extras
 
     def update_command(self, command: torch.Tensor) -> None:
         """Updates the command for the environment."""
@@ -130,8 +131,8 @@ class RslRlVecEnvHistoryWrapper(RslRlVecEnvWrapper):
 class VLNEnvWrapper:
     """Wrapper to configure an :class:`ManagerBasedRLEnv` instance to VLN environment."""
 
-    def __init__(self, env: ManagerBasedRLEnv, 
-                 low_level_policy, task_name, 
+    def __init__(self, env: ManagerBasedRLEnv,
+                 low_level_policy, task_name,
                  episode, max_length=10000, high_level_obs_key="camera_obs",
                  measure_names=["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess"]
         ):
@@ -167,7 +168,7 @@ class VLNEnvWrapper:
         """Reset the environment."""
         low_level_obs, infos = self.env.reset()
         self.low_level_obs = low_level_obs
-        zero_cmd = torch.tensor([0., 0., 0.], device=low_level_obs.device)
+        zero_cmd = torch.tensor([0., 0., 0.], device=self.unwrapped.device)
 
         if "go2" in self.task_name:
             warmup_steps = 100
@@ -187,7 +188,7 @@ class VLNEnvWrapper:
             self.low_level_action = actions
 
         self.env_step, self.same_pos_count = 0, 0
-        
+
         self.set_measures()
         self.measure_manager.reset_measures()
         measurements = self.measure_manager.get_measurements()
@@ -197,7 +198,7 @@ class VLNEnvWrapper:
 
         obs = infos["observations"][self.high_level_obs_key]
         return obs, infos
-    
+
     def update_command(self, command) -> None:
         """Update the command for the low-level policy."""
 
@@ -206,11 +207,11 @@ class VLNEnvWrapper:
             command = torch.tensor(command, device=self.env.unwrapped.device)
 
         if isinstance(self.env, RslRlVecEnvHistoryWrapper):
-            self.low_level_obs[:, 6:9] = command
+            self.low_level_obs["policy"][:, 6:9] = command
             self.env.proprio_obs_buf[:, -1, 6:9] = command
-        
+
         else:
-            self.low_level_obs[:, 9:12] = command
+            self.low_level_obs["policy"][:, 9:12] = command
 
     def step(self, action) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Take a step in the environment.
@@ -223,7 +224,7 @@ class VLNEnvWrapper:
             reward: The reward of the environment.
             done: Whether the episode is done.
             info: Additional information of the environment.
-        
+
         """
 
         self.update_command(action)
@@ -245,7 +246,7 @@ class VLNEnvWrapper:
         done = done[0] or same_pos or self.env_step >= self.max_length or self.is_stop_called
 
         return obs, reward, done, info
-    
+
     def check_same_pos(self) -> bool:
         curr_pos = self.env.unwrapped.scene["robot"].data.root_pos_w[0].detach()
         robot_vel = torch.norm(self.env.unwrapped.scene["robot"].data.root_vel_w[0].detach())
@@ -259,15 +260,13 @@ class VLNEnvWrapper:
         if self.same_pos_count >= 1000:
             print("Robot has stayed in the same location for 1000 steps. Breaking out of the loop.")
             return True
-        
+
         return False
 
     def set_stop_called(self, is_stop_called: bool) -> None:
         """Set the stop called flag."""
         self.env.is_stop_called = is_stop_called
         self.is_stop_called = is_stop_called
-    
+
     def close(self) -> None:
         self.env.close()
-
-    
