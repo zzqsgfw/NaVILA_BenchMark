@@ -22,7 +22,7 @@ import io
 import socket
 import json
 
-from omni.isaac.lab.app import AppLauncher
+from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
@@ -63,17 +63,17 @@ simulation_app = app_launcher.app
 
 from rsl_rl.runners import OnPolicyRunner
 
-import omni.isaac.lab_tasks  # noqa: F401
-from omni.isaac.lab_tasks.utils import get_checkpoint_path, parse_env_cfg
-from omni.isaac.lab.utils.io import load_yaml
-import omni.isaac.lab.utils.math as math_utils
-from omni.isaac.lab.markers import VisualizationMarkers, VisualizationMarkersCfg
-from omni.isaac.lab.utils import update_class_from_dict
-from omni.isaac.lab_tasks.utils.wrappers.rsl_rl import (
+import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
+from isaaclab.utils.io import load_yaml
+import isaaclab.utils.math as math_utils
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from isaaclab.utils import update_class_from_dict
+from isaaclab_tasks.utils.wrappers.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
     RslRlVecEnvWrapper,
 )
-import omni.isaac.lab.sim as sim_utils
+import isaaclab.sim as sim_utils
 
 from omni.isaac.vlnce.config import *
 from omni.isaac.vlnce.utils import ASSETS_DIR, RslRlVecEnvHistoryWrapper, VLNEnvWrapper

@@ -1,12 +1,12 @@
 import os
 
-from omni.isaac.lab.managers import ObservationGroupCfg as ObsGroup
-from omni.isaac.lab.managers import ObservationTermCfg as ObsTerm
-from omni.isaac.lab.managers import SceneEntityCfg
-from omni.isaac.lab.utils import configclass
-from omni.isaac.lab.utils.noise import AdditiveUniformNoiseCfg as Unoise
-from omni.isaac.lab.sensors import CameraCfg, ContactSensorCfg, RayCasterCfg, patterns
-from omni.isaac.lab.sensors.ray_caster import RayCasterCameraCfg, patterns
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils import configclass
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+from isaaclab.sensors import CameraCfg, ContactSensorCfg, RayCasterCfg, patterns
+from isaaclab.sensors.ray_caster import RayCasterCameraCfg, patterns
 
 import omni.isaac.vlnce.vlnce.mdp as mdp
 
