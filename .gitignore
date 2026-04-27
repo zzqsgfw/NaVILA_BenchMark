@@ -1,4 +1,30 @@
 .vscode/
-isaaclab_exts/omni.isaac.vlnce/assets
+.idea/
+
+# Python
+__pycache__/
 *.pyc
-*.egg-info
+*.pyo
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+
+# Datasets / heavyweight assets
+isaaclab_exts/omni.isaac.vlnce/assets/
+
+# Runtime outputs
+eval_results/
+outputs/
+videos/
+*.log
+
+# Logger artifacts
+wandb/
+runs/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
