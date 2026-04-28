@@ -30,6 +30,7 @@ from isaacsim.core.utils import extensions
 
 extensions.enable_extension("omni.kit.asset_converter")
 import omni.kit.asset_converter as converter
+from pxr import Usd
 
 
 class MatterportConverter:
@@ -139,13 +140,49 @@ class MatterportImporter(TerrainImporter):
             "Please use the async function to convert the obj file to usd first (accessed over the extension in the GUI)"
         )
 
+        # The matterport USD files declare metersPerUnit=0.01 + upAxis=Y, but the actual
+        # IsaacLab stage is metersPerUnit=1.0 + upAxis=Z. The implicit cm->m conversion
+        # shrinks the room to ~30 cm and the Y-up to Z-up reference doesn't rotate the
+        # geometry so the floor ends up sideways (in Y) instead of under the robot.
+        # Patch the source USD's stage metadata so it matches the IL stage and no
+        # implicit conversion happens at reference time.
+        from pxr import UsdGeom as _UsdGeom
+        _src_stage = Usd.Stage.Open(base_path + ".usd")
+        _changed = False
+        if _UsdGeom.GetStageMetersPerUnit(_src_stage) != 1.0:
+            _UsdGeom.SetStageMetersPerUnit(_src_stage, 1.0)
+            _changed = True
+        if _UsdGeom.GetStageUpAxis(_src_stage) != _UsdGeom.Tokens.z:
+            _UsdGeom.SetStageUpAxis(_src_stage, _UsdGeom.Tokens.z)
+            _changed = True
+        if _changed:
+            _src_stage.GetRootLayer().Save()
+
         self._xform_prim = prim_utils.create_prim(
             prim_path=self.cfg.prim_path + "/Matterport", translation=(0.0, 0.0, 0.0), usd_path=base_path + ".usd"
         )
 
-        # apply collider properties
-        collider_cfg = sim_utils.CollisionPropertiesCfg(collision_enabled=True)
-        sim_utils.define_collision_properties(self._xform_prim.GetPrimPath(), collider_cfg)
+        # Walk the matterport USD subtree and apply static collision to every Mesh
+        # descendant. We Apply the schemas directly because the IsaacLab high-level
+        # helpers (sim_utils.define_collision_properties etc.) only modify an existing
+        # CollisionAPI; they do not Apply it across a referenced subtree.
+        # mesh_approximation="meshSimplification" keeps a triangle-mesh collider but
+        # reduces face count before cooking - "none" hangs PhysX cooking on the raw
+        # ~230k face matterport mesh.
+        from pxr import UsdGeom, UsdPhysics, PhysxSchema
+        for prim in Usd.PrimRange(self._xform_prim):
+            if not prim.IsA(UsdGeom.Mesh):
+                continue
+            if not UsdPhysics.CollisionAPI(prim):
+                UsdPhysics.CollisionAPI.Apply(prim)
+            UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Set(True)
+            if not UsdPhysics.MeshCollisionAPI(prim):
+                UsdPhysics.MeshCollisionAPI.Apply(prim)
+            UsdPhysics.MeshCollisionAPI(prim).GetApproximationAttr().Set("meshSimplification")
+            if not PhysxSchema.PhysxTriangleMeshSimplificationCollisionAPI(prim):
+                PhysxSchema.PhysxTriangleMeshSimplificationCollisionAPI.Apply(prim)
+            if not PhysxSchema.PhysxCollisionAPI(prim):
+                PhysxSchema.PhysxCollisionAPI.Apply(prim)
 
         # create physics material
         physics_material_cfg: sim_utils.RigidBodyMaterialCfg = self.cfg.physics_material
