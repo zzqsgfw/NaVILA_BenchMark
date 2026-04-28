@@ -42,7 +42,7 @@ parser.add_argument("--use_rnn", action="store_true", default=False, help="Use R
 parser.add_argument("--visualize_path", action="store_true", default=False, help="Visualize the path in the simulator.")
 
 # navila argparse arguments
-parser.add_argument("--device", type=str, default="cuda")
+# (--device is now provided by AppLauncher.add_app_launcher_args in IL HEAD)
 parser.add_argument("--vlm_host", type=str, default="localhost")
 parser.add_argument("--vlm_port", type=int, default=54321)
 
