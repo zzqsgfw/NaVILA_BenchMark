@@ -192,7 +192,9 @@ class ObservationsCfg:
         """Observations for camera group."""
         rgb_measurement = ObsTerm(
             func=mdp.isaac_camera_data,
-            params={"sensor_cfg": SceneEntityCfg("rgb_camera"), "data_type": "rgb"},
+            # scene entity is named ``rgbd_camera`` (it carries both rgb + depth);
+            # the original cfg referenced ``rgb_camera`` which doesn't exist.
+            params={"sensor_cfg": SceneEntityCfg("rgbd_camera"), "data_type": "rgb"},
         )
 
         def __post_init__(self):
@@ -279,7 +281,9 @@ class TerrainSceneCfg(InteractiveSceneCfg):
             dynamic_friction=1.0,
         ),
         obj_filepath=os.path.join(ASSETS_DIR, "matterport_usd/5q7pvUzZiYa/5q7pvUzZiYa.usd"),
-        groundplane=False,
+        # matterport mesh has no PhysX collider (cook is intractable); robot stands
+        # on the infinite GroundPlane and wall proximity is read from lidar RayCaster.
+        groundplane=True,
     )
 
     # robots

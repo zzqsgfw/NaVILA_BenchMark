@@ -49,6 +49,14 @@ parser.add_argument("--vlm_port", type=int, default=54321)
 
 # r2r argparse arguments
 parser.add_argument("--episode_idx", type=int, default=0)
+parser.add_argument("--episode_idx_list", type=str, default=None,
+                    help="Comma-separated list of episode indices. If set, overrides --episode_idx "
+                         "and runs them all in a single process (avoids the ~30-60s per-ep Isaac "
+                         "app launch + USD load + python startup overhead).")
+parser.add_argument("--skip_if_done", action="store_true", default=False,
+                    help="Skip episodes whose measurement json already exists (for resume).")
+parser.add_argument("--precook", action="store_true", default=False,
+                    help="Only build the env (cooks + caches the matterport collision mesh) then hard-exit. One-time per scene.")
 
 # RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -60,6 +68,11 @@ args_cli = parser.parse_args()
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(__file__))
+from _meshcache import enable_local_mesh_cache
+enable_local_mesh_cache()
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -181,7 +194,10 @@ def sample_images_and_send_to_vlm(image_list, vlm_host, vlm_port, query):
     #     img = Image.fromarray(img)
     #     img.save(os.path.join("test_images", f"{time_stamp}_image_{i}.jpg"))
 
-    # Convert images to base64 for transmission
+    # Convert images to base64 for transmission. Downsize to 224x224 first —
+    # the VLM (SigLIP/CLIP) resizes to 224 anyway. Sending 512x512 wastes ~80%
+    # of JPEG encode + transfer cost on every VLM call (8 frames × ~40 calls
+    # per episode = ~2-5 s saved per ep).
     encoded_images = []
     for image in sampled_images:
         # Ensure PIL Image for JPEG encoding
@@ -200,8 +216,12 @@ def sample_images_and_send_to_vlm(image_list, vlm_host, vlm_port, query):
             # Fallback: try to construct a PIL image from whatever object is provided
             pil_image = Image.fromarray(np.array(image, dtype=np.uint8))
 
+        # Pre-resize to 224 (VLM target) — major JPEG/transfer-time saver.
+        if pil_image.size != (224, 224):
+            pil_image = pil_image.resize((224, 224), Image.BILINEAR)
+
         buffered = io.BytesIO()
-        pil_image.save(buffered, format="JPEG")
+        pil_image.save(buffered, format="JPEG", quality=85)
         encoded_images.append(base64.b64encode(buffered.getvalue()).decode())
 
     # Prepare request data
@@ -234,13 +254,13 @@ def sample_images_and_send_to_vlm(image_list, vlm_host, vlm_port, query):
         return response
 
 
-def main():
-    """IsaacSim Evaluation using NaViLA and trained low-level policy."""
+def _run_one_episode(episode, ep_idx):
+    """Run a single navigation episode end-to-end (env build → reset → loop → dump).
 
-    # read R2R test episodes
-    r2r_data_path = os.path.join(ASSETS_DIR, "vln_ce_isaac_v1.json.gz")
-    all_episodes = read_episodes(r2r_data_path)
-    episode = all_episodes[args_cli.episode_idx]
+    Factored out of ``main()`` so a single process can drive many episodes
+    without paying the ~30-60s per-episode Isaac Sim cold-start + Python
+    startup + USD load.
+    """
 
     env_cfg = parse_env_cfg(args_cli.task, num_envs=args_cli.num_envs)
 
@@ -275,15 +295,21 @@ def main():
     else:
         env = RslRlVecEnvWrapper(env)
 
-    # Strip cfg keys that newer rsl-rl versions do not accept.
+    # Strip cfg keys that newer rsl-rl versions do not accept (only for the new
+    # stack; the old IL 2.2.1 / rsl-rl 2.3.3 stack on volc3 lacks the shim and
+    # the original NaVILA-Bench code path is used as-is).
     import inspect as _inspect
     import rsl_rl as _rsl_rl
     from rsl_rl.algorithms.ppo import PPO as _PPO
-    from isaaclab_rl.rsl_rl import handle_deprecated_rsl_rl_cfg
-    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, getattr(_rsl_rl, "__version__", "3.0.1"))
-    _ppo_kw = set(_inspect.signature(_PPO.__init__).parameters.keys()) | {"class_name"}
-    agent_cfg_dict = agent_cfg.to_dict()
-    agent_cfg_dict["algorithm"] = {k: v for k, v in agent_cfg_dict["algorithm"].items() if k in _ppo_kw}
+    try:
+        from isaaclab_rl.rsl_rl import handle_deprecated_rsl_rl_cfg
+        agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, getattr(_rsl_rl, "__version__", "3.0.1"))
+        _ppo_kw = set(_inspect.signature(_PPO.__init__).parameters.keys()) | {"class_name"}
+        agent_cfg_dict = agent_cfg.to_dict()
+        agent_cfg_dict["algorithm"] = {k: v for k, v in agent_cfg_dict["algorithm"].items() if k in _ppo_kw}
+    except ImportError:
+        # old stack: cfg passed through unchanged, matches original NaVILA-Bench usage
+        agent_cfg_dict = agent_cfg.to_dict()
 
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=None, device=agent_cfg.device)
@@ -291,7 +317,7 @@ def main():
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
-    all_measures = ["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess"]
+    all_measures = ["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess", "CollisionRate", "TerminationReason", "ObstacleClearance"]
     env = VLNEnvWrapper(env, policy, args_cli.task, episode, high_level_obs_key="camera_obs",
                         measure_names=all_measures)
     
@@ -306,6 +332,14 @@ def main():
     
     # step with zeros actions to get the initial frame
     obs, infos = env.reset()
+
+    if args_cli.precook:
+        # env build + reset has triggered & completed the matterport collision
+        # cook, which (with useLocalMeshCache on) is now written to the on-disk
+        # mesh cache. Nothing else needed; hard-exit to skip Isaac finalize hang.
+        import os as _o
+        print("[precook] cook done + cached; hard exit", flush=True)
+        _o._exit(0)
 
     # NaViLA training gets image observations each 0.5s, visualize every 0.1s
     steps_per_image = 0.5 / (env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation)
@@ -329,6 +363,16 @@ def main():
     same_pos_count = 0
     prev_pos = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
     max_episode_steps = 100 * 0.5 / (env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation)
+
+    # ---- comprehensive per-episode trace (record once, analyse offline forever) ----
+    trace_events = []      # one record per VLM call
+    traj = []              # per-step [step, x, y, z, yaw, d2g]
+    proprio = []           # per-step full robot state (quat,base vel,joint pos/vel,contacts)
+    n_vlm_calls = 0
+    n_parse_fall = 0
+    broke_by = "running"
+    parse_info = {"action": "none", "mag_matched": False, "fallthrough": False}
+
     # visualizer = define_markers()
     # simulate environment
     while simulation_app.is_running():
@@ -336,16 +380,65 @@ def main():
         with torch.inference_mode():
             if num_steps == target_steps:
                 stream_output = sample_images_and_send_to_vlm(image_observations, args_cli.vlm_host, args_cli.vlm_port, instruction.instruction_text)
-                vlm_vel_commands, time_to_go = get_vel_command(stream_output)
+                vlm_vel_commands, time_to_go, parse_info = get_vel_command(stream_output)
                 env_steps_to_go = int(time_to_go / (
                     env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation
                 ))
                 target_steps = num_steps + env_steps_to_go
                 print(f"VLM output: {stream_output}\nVel Command: {vlm_vel_commands}, Env Steps to go: {env_steps_to_go}\n")
 
+                # record this VLM call into the trace
+                n_vlm_calls += 1
+                if parse_info["fallthrough"]:
+                    n_parse_fall += 1
+                _rp = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
+                _rq = env.unwrapped.scene["robot"].data.root_quat_w[0].detach().cpu().numpy()
+                _, _, _yaw = quat2eulers(_rq[0], _rq[1], _rq[2], _rq[3])
+                _meas = infos.get("measurements", {}) if isinstance(infos, dict) else {}
+                trace_events.append({
+                    "step": int(num_steps),
+                    "raw": stream_output,
+                    "vel": [float(v) for v in vlm_vel_commands],
+                    "time_to_go": float(time_to_go),
+                    "env_steps_to_go": int(env_steps_to_go),
+                    "parse": parse_info,
+                    "x": float(_rp[0]), "y": float(_rp[1]), "z": float(_rp[2]),
+                    "yaw": float(_yaw),
+                    "d2g": float(_meas.get("distance_to_goal", -1.0)),
+                    "n_frames_avail": len(image_observations),  # frames the VLM saw this call
+                })
+
         obs, _, done, infos = env.step(torch.tensor(vlm_vel_commands, device = obs.device))
 
+        # per-step trajectory sample (cheap; lets any future metric be recomputed offline)
+        _p = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
+        _q = env.unwrapped.scene["robot"].data.root_quat_w[0].detach().cpu().numpy()
+        _, _, _y = quat2eulers(_q[0], _q[1], _q[2], _q[3])
+        _m = infos.get("measurements", {}) if isinstance(infos, dict) else {}
+        traj.append([int(num_steps), float(_p[0]), float(_p[1]), float(_p[2]),
+                     float(_y), float(_m.get("distance_to_goal", -1.0))])
+        # full proprioceptive state per step (arbiter inputs / dynamics analysis)
+        try:
+            _rd = env.unwrapped.scene["robot"].data
+            _row = np.concatenate([
+                np.array([int(num_steps)], dtype=np.float32),
+                _q.astype(np.float32),                                            # root quat w,x,y,z (4)
+                _rd.root_lin_vel_b[0].detach().cpu().numpy().astype(np.float32),   # base lin vel xyz (3)
+                _rd.root_ang_vel_b[0].detach().cpu().numpy().astype(np.float32),   # base ang vel xyz (3)
+                _rd.joint_pos[0].detach().cpu().numpy().astype(np.float32),        # joint pos (12)
+                _rd.joint_vel[0].detach().cpu().numpy().astype(np.float32),        # joint vel (12)
+            ])
+            try:
+                _cf = env.unwrapped.scene.sensors["contact_forces"].data.net_forces_w[0]
+                _row = np.concatenate([_row, _cf.norm(dim=-1).detach().cpu().numpy().astype(np.float32)])  # per-body |contact|
+            except Exception:
+                pass
+            proprio.append(_row)
+        except Exception:
+            pass
+
         if done or env.is_stop_called or num_steps > max_episode_steps:
+            broke_by = "done" if done else ("stop" if env.is_stop_called else "maxsteps")
             break
 
         cur_pos = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
@@ -359,6 +452,7 @@ def main():
         # Break out of the loop if the robot has stayed in the same location for 500 steps
         if same_pos_count >= 1000:
             print("Robot has stayed in the same location for 1000 steps. Breaking out of the loop.")
+            broke_by = "stuck"
             break
 
         if num_steps % steps_per_image == 0:
@@ -379,6 +473,11 @@ def main():
         # if args_cli.visualize_path:
         #     visualizer.visualize(reference_path_isaac)
     measurements = infos["measurements"]
+    # parse-failure stats into the lightweight summary (class-(c) signal + IPSR)
+    measurements["n_vlm_calls"] = int(n_vlm_calls)
+    measurements["n_parse_fallthrough"] = int(n_parse_fall)
+    measurements["parse_fail_rate"] = (n_parse_fall / n_vlm_calls) if n_vlm_calls else 0.0
+    measurements["broke_by"] = broke_by
 
     result_dir = f"eval_results/{args_cli.task}_loco_{args_cli.load_run}"
     if not os.path.exists(result_dir):
@@ -387,8 +486,83 @@ def main():
     measurement_dir = os.path.join(result_dir, "measurements")
     if not os.path.exists(measurement_dir):
         os.makedirs(measurement_dir)
-    with open(f"{measurement_dir}/{int(episode['episode_id'])-1}.json", "w") as f:
+    eid = int(episode['episode_id']) - 1
+    with open(f"{measurement_dir}/{eid}.json", "w") as f:
         json.dump(measurements, f, indent=4)
+
+    # ---- comprehensive trace: everything needed for ANY future offline analysis
+    # (failure decomposition, drift, parse attribution, arbiter design) so the
+    # expensive Isaac run never has to be repeated for a new analysis need ----
+    trace_dir = os.path.join(result_dir, "traces")
+    os.makedirs(trace_dir, exist_ok=True)
+    try:
+        clr_series = list(env.measure_manager.measures["obstacle_clearance"]._step_min)
+    except Exception:
+        clr_series = []
+    trace = {
+        "episode_id": episode["episode_id"],
+        "episode_idx": ep_idx,
+        "scene_id": episode.get("scene_id"),
+        "instruction": episode["instruction"]["instruction_text"],
+        "start_position": episode.get("start_position"),
+        "goals": episode.get("goals"),
+        "gt_locations": episode.get("gt_locations"),
+        "task": args_cli.task,
+        "low_level_run": args_cli.load_run,
+        "summary": measurements,
+        "termination_reason": measurements.get("termination_reason"),
+        "broke_by": broke_by,
+        "num_steps": int(num_steps),
+        "vlm_events": trace_events,
+        "clearance_step_series": clr_series,
+        # exact VLM input is: this server prompt template, with {n-1} history +
+        # 1 current frame sampled from the recorded frame sequence (frames.npz),
+        # and {instruction}. n_frames_avail per event = frames the server saw.
+        "vlm_prompt_template": (
+            "Imagine you are a robot programmed for navigation tasks. You have been "
+            "given a video of historical observations <image>*({num_video_frames}-1), "
+            "and current observation <image>. Your assigned task is: \"{instruction}\" "
+            "Analyze this series of images to decide your next action, which could be "
+            "turning left or right by a specific degree, moving forward a certain "
+            "distance, or stop if the task is completed."
+        ),
+        "vlm_num_video_frames": 8,
+        "proprio_cols": (["step", "qw", "qx", "qy", "qz",
+                          "vlin_x", "vlin_y", "vlin_z", "vang_x", "vang_y", "vang_z"]
+                         + [f"jpos_{i}" for i in range(12)]
+                         + [f"jvel_{i}" for i in range(12)]
+                         + ["contact_body_norms..."]),
+    }
+    with open(os.path.join(trace_dir, f"{eid}.json"), "w") as f:
+        json.dump(trace, f)
+    if len(traj) > 0:
+        _npz = dict(
+            traj=np.asarray(traj, dtype=np.float32),  # [N,6]: step,x,y,z,yaw,d2g
+            traj_cols=np.array(["step", "x", "y", "z", "yaw", "d2g"]),
+            clearance=np.asarray(clr_series, dtype=np.float32),
+        )
+        if len(proprio) > 0:
+            # rows can differ in length only if contact body count varies; pad-safe
+            _w = max(len(r) for r in proprio)
+            _pr = np.full((len(proprio), _w), np.nan, dtype=np.float32)
+            for _i, _r in enumerate(proprio):
+                _pr[_i, :len(_r)] = _r
+            _npz["proprio"] = _pr
+        np.savez_compressed(os.path.join(trace_dir, f"{eid}.npz"), **_npz)
+    # exact frames fed to the VLM over the episode (JPEG, ~30KB ea) so every
+    # VLM input can be reconstructed offline without re-running Isaac
+    try:
+        import io
+        _buf = []
+        for _im in image_observations:
+            _b = io.BytesIO(); _im.save(_b, format="JPEG", quality=85)
+            _buf.append(np.frombuffer(_b.getvalue(), dtype=np.uint8))
+        np.savez_compressed(
+            os.path.join(trace_dir, f"{eid}_frames.npz"),
+            frames=np.array(_buf, dtype=object),
+        )
+    except Exception as _e:
+        print(f"[trace] frame dump skipped: {_e}")
 
 
     video_dir = os.path.join(result_dir, "videos")
@@ -405,6 +579,43 @@ def main():
     # close the simulator
     env.close()
 
+
+def main():
+    """Drive one or many episodes in a single Isaac Sim process.
+
+    --episode_idx_list "i,j,k,..." lets one navila_eval process run a batch of
+    episodes, paying the Isaac Sim cold-start cost only once (vs. once per
+    episode in the old per-ep subprocess model). With --skip_if_done, we resume
+    by skipping ep indices whose measurement json already exists.
+    """
+    import traceback as _tb
+    r2r_data_path = os.path.join(ASSETS_DIR, "vln_ce_isaac_v1.json.gz")
+    all_episodes = read_episodes(r2r_data_path)
+
+    if args_cli.episode_idx_list:
+        ep_indices = [int(x) for x in args_cli.episode_idx_list.split(",") if x.strip()]
+    else:
+        ep_indices = [args_cli.episode_idx]
+
+    # Resolve result_dir for resume-skip (matches the path used inside _run_one_episode).
+    result_dir = os.path.join(os.path.dirname(__file__), "..",
+                              f"eval_results/{args_cli.task}_loco_{args_cli.load_run}")
+    measurement_dir = os.path.join(result_dir, "measurements")
+
+    print(f"[batch] driving {len(ep_indices)} episodes in this process", flush=True)
+    for i, ep_idx in enumerate(ep_indices):
+        if args_cli.skip_if_done:
+            eid = int(all_episodes[ep_idx]['episode_id']) - 1
+            if os.path.exists(f"{measurement_dir}/{eid}.json"):
+                print(f"[batch] ({i+1}/{len(ep_indices)}) ep_idx={ep_idx} eid={eid}: SKIP (done)", flush=True)
+                continue
+        print(f"[batch] ({i+1}/{len(ep_indices)}) ep_idx={ep_idx}: START", flush=True)
+        try:
+            _run_one_episode(all_episodes[ep_idx], ep_idx)
+        except Exception:
+            print(f"[batch] ep_idx={ep_idx}: FAILED", flush=True)
+            _tb.print_exc()
+    print(f"[batch] all done.", flush=True)
 
 
 if __name__ == "__main__":

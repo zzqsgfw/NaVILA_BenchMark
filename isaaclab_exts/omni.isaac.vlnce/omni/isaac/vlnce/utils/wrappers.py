@@ -58,17 +58,45 @@ class RslRlVecEnvHistoryWrapper(RslRlVecEnvWrapper):
 
         self.clip_actions = 20.0
 
-    def _build_obs_td(self, obs_dict: dict, curr_obs: torch.Tensor) -> TensorDict:
-        """Bundle the policy tensor (with history) and the rest of the obs groups into a TensorDict."""
-        td_dict = dict(obs_dict)
-        td_dict["policy"] = curr_obs
-        return TensorDict(td_dict, batch_size=[self.num_envs])
+        # rsl-rl 2.x expects a raw torch.Tensor for ``obs`` (e.g. ``num_obs = obs.shape[1]``);
+        # rsl-rl 3.x consumes a TensorDict bundling history + camera channels.
+        # rsl_rl 2.3.3 does NOT expose ``__version__``; detect by probing for a
+        # symbol that only exists in the new IL/rsl-rl stack.
+        try:
+            from isaaclab_rl.rsl_rl import handle_deprecated_rsl_rl_cfg  # noqa: F401
+            self._use_obs_td = True
+        except ImportError:
+            self._use_obs_td = False
+
+    def _build_obs_td(self, obs_dict: dict, curr_obs: torch.Tensor):
+        """Return the policy observation in the form the runtime rsl-rl version expects.
+
+        - rsl-rl 3.x: TensorDict bundling all obs groups (policy=curr_obs with history,
+          plus rgb/depth/proprio for camera-conditioned heads).
+        - rsl-rl 2.3.3 (IL 2.2.1 / Isaac Sim 4.5 stack on volc3): raw tensor — the
+          locomotion policy was trained with rsl-rl 2.x and reads only ``curr_obs``;
+          the VLM (high-level) reads camera obs separately from the env, not from
+          this return.
+        """
+        if self._use_obs_td:
+            td_dict = dict(obs_dict)
+            td_dict["policy"] = curr_obs
+            return TensorDict(td_dict, batch_size=[self.num_envs])
+        return curr_obs
 
     """
     Properties
     """
-    def get_observations(self) -> TensorDict:
-        """Returns the current observations of the environment."""
+    def get_observations(self):
+        """Returns the current observations of the environment.
+
+        Returns ``(obs_td, extras_dict)`` to match the base
+        ``RslRlVecEnvWrapper.get_observations`` contract — required by
+        rsl-rl 2.3.3 (IL 2.2.1 / Isaac Sim 4.5 stack) where
+        ``OnPolicyRunner.__init__`` does ``obs, extras = env.get_observations()``.
+        Returning a single TensorDict (earlier IS5.1 migration shape) broke
+        unpack on the old stack.
+        """
         if hasattr(self.unwrapped, "observation_manager"):
             obs_dict = self.unwrapped.observation_manager.compute()
         else:
@@ -77,7 +105,7 @@ class RslRlVecEnvHistoryWrapper(RslRlVecEnvWrapper):
         self.proprio_obs_buf = torch.cat([proprio_obs.unsqueeze(1)] * self.history_length, dim=1)
         proprio_obs_history = self.proprio_obs_buf.view(self.num_envs, -1)
         curr_obs = torch.cat([obs, proprio_obs_history], dim=1)
-        return self._build_obs_td(obs_dict, curr_obs)
+        return self._build_obs_td(obs_dict, curr_obs), {"observations": obs_dict}
 
     def reset(self) -> tuple[TensorDict, dict]:
         """Resets the environment."""
@@ -206,12 +234,18 @@ class VLNEnvWrapper:
         if not torch.is_tensor(command):
             command = torch.tensor(command, device=self.env.unwrapped.device)
 
+        # On the rsl-rl 2.3.3 / IL 2.2.1 stack, RslRlVecEnvHistoryWrapper hands us a
+        # raw policy tensor (no TensorDict wrapping) so the slice goes directly on
+        # ``low_level_obs``. On the rsl-rl 3.x stack we still hold a TensorDict.
+        is_td = not torch.is_tensor(self.low_level_obs)
         if isinstance(self.env, RslRlVecEnvHistoryWrapper):
-            self.low_level_obs["policy"][:, 6:9] = command
+            policy_slice = self.low_level_obs["policy"] if is_td else self.low_level_obs
+            policy_slice[:, 6:9] = command
             self.env.proprio_obs_buf[:, -1, 6:9] = command
 
         else:
-            self.low_level_obs["policy"][:, 9:12] = command
+            policy_slice = self.low_level_obs["policy"] if is_td else self.low_level_obs
+            policy_slice[:, 9:12] = command
 
     def step(self, action) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Take a step in the environment.

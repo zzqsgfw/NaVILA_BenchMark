@@ -66,11 +66,16 @@ class VLMServer:
             #     ],
             # ).to(self.args.device)
             model_name = get_model_name_from_path(args.model_path)
-            tokenizer, model, image_processor, context_len = load_pretrained_model(args.model_path, model_name, None)
+            tokenizer, model, image_processor, context_len = load_pretrained_model(
+                args.model_path, model_name, None,
+                load_8bit=getattr(args, "load_8bit", False),
+            )
             self.tokenizer =  tokenizer
             self.model = model
             self.image_processor = image_processor
-        self.model = self.model.to(self.args.device)
+        # int8 model is already placed by accelerate's device_map; .to() would error
+        if not getattr(self.args, "load_8bit", False):
+            self.model = self.model.to(self.args.device)
 
     def start_server(self, host='localhost', port=12345):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -148,7 +153,7 @@ class VLMServer:
                 temperature=0,
                 top_p=None,
                 num_beams=1,
-                max_new_tokens=512,
+                max_new_tokens=32,
                 use_cache=True,
                 stopping_criteria=[stopping_criteria],
             )
@@ -157,8 +162,11 @@ class VLMServer:
             # print("input_ids:", input_ids)
 
         outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
-        
-        return outputs.strip()
+        result = outputs.strip()
+        # release activation/KV fragmentation back to allocator — recovers ~20-50 MiB
+        # which is what closes the 48 MiB headroom gap when Isaac shares this GPU.
+        torch.cuda.empty_cache()
+        return result
 
 
 def process_images(images, image_processor, model_cfg):
@@ -195,6 +203,9 @@ if __name__ == "__main__":
     parser.add_argument("--conv_mode", type=str, default="llama_3")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_video_frames", type=int, default=8)
+    parser.add_argument("--load_8bit", action="store_true", default=False,
+                        help="Quantize VLM to int8 via bitsandbytes; ~8 GB vs ~17 GB fp16. "
+                             "Use when co-locating with Isaac Sim on the same GPU.")
     args = parser.parse_args()
     
     server = VLMServer(args)

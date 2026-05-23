@@ -325,7 +325,189 @@ class OracleSuccess(Measure):
         self._metric = float(self._metric or d < self._success_distance)
 
 
-def add_measurement(env, episode, measure_names=["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess"]):
+class CollisionRate(Measure):
+    """Collision Rate (CR).
+
+    Per-episode binary flag: 1.0 if the robot's torso (``base`` body) ever
+    registered a contact force above ``threshold`` during the episode, else 0.0.
+    Aggregated over episodes this is the collision rate. Mirrors the
+    ``base_contact`` termination logic (threshold 1.0) so CR is consistent with
+    why the episode ends. Also tracks the number of colliding steps for
+    intensity analysis.
+    """
+
+    cls_uuid: str = "collision"
+
+    def __init__(self, env, episode, measure_manager, threshold: float = 1.0, *args: Any, **kwargs: Any):
+        super().__init__(env, episode)
+        self.measure_manager = measure_manager
+        self._threshold = threshold
+        self._base_body_ids = None
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
+
+    def _contact_sensor(self):
+        return self._env.unwrapped.scene.sensors["contact_forces"]
+
+    def reset_metric(self, *args: Any, **kwargs: Any):
+        cs = self._contact_sensor()
+        # Resolve the torso/base body index once. Quadruped (Go2) calls it "base";
+        # humanoid (H1) has no "base" — try torso_link / pelvis instead.
+        ids = None
+        for name in ("base", "torso_link", "pelvis"):
+            try:
+                ids, _ = cs.find_bodies(name)
+                if ids:
+                    break
+            except ValueError:
+                continue
+        if not ids:
+            raise ValueError(
+                f"CollisionRate: no recognised base body in {cs.body_names}; "
+                "extend the candidate list in measures.py:CollisionRate.reset_metric")
+        self._base_body_ids = ids
+        self._collided = False
+        self._n_collision_steps = 0
+        self._metric = 0.0
+
+    def update_metric(self, *args: Any, **kwargs: Any):
+        cs = self._contact_sensor()
+        # net_forces_w_history: [num_envs, history, num_bodies, 3]
+        net = cs.data.net_forces_w_history
+        force = net[:, :, self._base_body_ids].norm(dim=-1)  # [N, hist, n_base]
+        max_force = force.max(dim=1)[0].max(dim=-1)[0]  # per-env scalar
+        if float(max_force[0]) > self._threshold:
+            self._collided = True
+            self._n_collision_steps += 1
+        self._metric = 1.0 if self._collided else 0.0
+
+
+class TerminationReason(Measure):
+    """Latches WHY the episode ended, read from the env TerminationManager.
+
+    Values: "collision" (base_contact), "fell_over" (bad_orientation),
+    "timeout" (time_out), or "none" (ended by stop / stuck / max steps with no
+    sim termination). Combine with the ``success`` metric in post-analysis to
+    get the success / collision / fell / timeout breakdown for the CR-SPL study.
+    """
+
+    cls_uuid: str = "termination_reason"
+
+    # checked in priority order; first fired term is latched
+    _TERM_MAP = [
+        ("base_contact", "collision"),
+        ("bad_orientation", "fell_over"),
+        ("time_out", "timeout"),
+    ]
+
+    def __init__(self, env, episode, measure_manager, *args: Any, **kwargs: Any):
+        super().__init__(env, episode)
+        self.measure_manager = measure_manager
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
+
+    def reset_metric(self, *args: Any, **kwargs: Any):
+        self._metric = "none"
+
+    def update_metric(self, *args: Any, **kwargs: Any):
+        if self._metric != "none":
+            return  # already latched
+        tm = self._env.unwrapped.termination_manager
+        active = set(tm.active_terms)
+        for term_name, reason in self._TERM_MAP:
+            if term_name in active and bool(tm.get_term(term_name)[0]):
+                self._metric = reason
+                return
+
+
+class ObstacleClearance(Measure):
+    """Continuous obstacle-clearance safety metric.
+
+    Binary CR (torso contact) is too coarse: a quadruped brushing a doorframe
+    with a leg, or wedging against a wall without a >1.0 base hit, registers
+    nothing. This measure reads the body-mounted ``lidar_sensor`` raycaster
+    (the same one feeding the policy) and, every step, computes the minimum
+    HORIZONTAL distance to an obstacle at body height.
+
+    Floor exclusion is floor-adaptive: floor_z = lowest finite lidar hit this
+    step; only hits in the band [floor_z+0.10, floor_z+1.5] m count (the
+    sensor sits only ~0.2-0.35 m above the floor, so a fixed +/-dz band around
+    the sensor leaks floor hits straight down and pins the min to ~0 — that
+    was the original bug, verified via diag_zero_cmd lidar introspection).
+
+    Reported (dict): episode min of per-step clearance, p5 of per-step
+    clearance (robust "boxed-in" indicator; raw min is noisy, pinned by a few
+    grazing rays), mean, and frac of steps below 0.3 m (near-miss dwell). p5
+    is the principled criterion for selecting / building the crash-test split.
+
+    Degrades safely: sensor absent or a step with no valid band hit is
+    skipped; an episode with no valid reading reports -1.0.
+    """
+
+    cls_uuid: str = "obstacle_clearance"
+
+    _NEAR = 0.3            # m, near-miss threshold
+    _FLOOR_MARGIN = 0.10   # m above the adaptive floor to start the body band
+    _BODY_TOP = 1.5        # m above the adaptive floor to end the body band
+    _MIN_RAY = 0.05        # m, drop degenerate/self rays
+
+    def __init__(self, env, episode, measure_manager, sensor_name: str = "lidar_sensor",
+                 *args: Any, **kwargs: Any):
+        super().__init__(env, episode)
+        self.measure_manager = measure_manager
+        self._sensor_name = sensor_name
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
+
+    def reset_metric(self, *args: Any, **kwargs: Any):
+        self._step_min = []     # per-step min clearance
+        self._n_close = 0
+        self._metric = {"min": -1.0, "p5": -1.0, "mean": -1.0, "frac_lt_0p3": 0.0}
+
+    def update_metric(self, *args: Any, **kwargs: Any):
+        import torch
+        try:
+            sensors = self._env.unwrapped.scene.sensors
+            if self._sensor_name not in sensors:
+                return
+            sensor = sensors[self._sensor_name]
+            hits = sensor.data.ray_hits_w[0]          # [num_rays, 3] world
+            origin = sensor.data.pos_w[0]             # [3] world
+            finite = torch.isfinite(hits).all(dim=-1)
+            if finite.sum() == 0:
+                return
+            hits = hits[finite]
+            # floor-adaptive vertical band (exclude floor straight-down + ceiling)
+            floor_z = float(hits[:, 2].min())
+            band = (hits[:, 2] > floor_z + self._FLOOR_MARGIN) & (
+                hits[:, 2] < floor_z + self._BODY_TOP)
+            if band.sum() == 0:
+                return
+            horiz = (hits[band][:, :2] - origin[:2].unsqueeze(0)).norm(dim=-1)
+            horiz = horiz[horiz > self._MIN_RAY]
+            if horiz.numel() == 0:
+                return
+            c = float(horiz.min())
+        except Exception:
+            return  # never crash an episode over a metric
+
+        self._step_min.append(c)
+        if c < self._NEAR:
+            self._n_close += 1
+        n = len(self._step_min)
+        s = sorted(self._step_min)
+        self._metric = {
+            "min": s[0],
+            "p5": s[max(0, int(0.05 * n) - 1)],
+            "mean": sum(self._step_min) / n,
+            "frac_lt_0p3": self._n_close / n,
+        }
+
+
+def add_measurement(env, episode, measure_names=["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess", "CollisionRate", "TerminationReason", "ObstacleClearance"]):
     measure_manager = MeasureManager()
     for measure_name in measure_names:
         measure = eval(measure_name)(env, episode, measure_manager)

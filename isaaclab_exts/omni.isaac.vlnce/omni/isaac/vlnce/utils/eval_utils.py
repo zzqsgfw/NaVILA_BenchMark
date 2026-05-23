@@ -55,31 +55,44 @@ def add_instruction_on_img(img: np.ndarray, text: str, start_y=0) -> None:
 
 
 def get_vel_command(text):
-    if "turn left" in text.lower():
-        if "45" in text.lower():
-            return [0.0, 0.0, np.pi/6.0], 1.5
-        elif "30" in text.lower():
-            return [0.0, 0.0, np.pi/6.0], 1.0
-        elif "15" in text.lower():
-            return [0.0, 0.0, np.pi/6.0], 0.5
-        return [0.0, 0.0, np.pi/6.0], 0.5
-    elif "turn right" in text.lower():
-        if "45" in text.lower():
-            return [0.0, 0.0, -np.pi/6.0], 1.5
-        elif "30" in text.lower():
-            return [0.0, 0.0, -np.pi/6.0], 1.0
-        elif "15" in text.lower():
-            return [0.0, 0.0, -np.pi/6.0], 0.5
-        return [0.0, 0.0, -np.pi/6.0], 0.5
-    elif "move forward" in text.lower() or "move" in text.lower():
-        if "75" in text.lower():
-            return [0.5, 0.0, 0.0], 1.5
-        elif "50" in text.lower():
-            return [0.5, 0.0, 0.0], 1.0
-        elif "25" in text.lower():
-            return [0.5, 0.0, 0.0], 0.5
-        return [0.5, 0.0, 0.0], 0.5
-    elif "stop" in text.lower():
-        return [0.0, 0.0, 0.0], 0.0
+    """Parse the VLM free-text into a velocity command.
+
+    Returns (vel, time_to_go, parse): `parse` is a dict for offline failure
+    attribution / IPSR:
+      action        : turn_left | turn_right | move_forward | stop | unparsed
+      mag_matched   : whether an expected magnitude token (15/30/45 deg or
+                      25/50/75 cm) was found; False means the magnitude was
+                      guessed (brittle-parse near-miss)
+      fallthrough   : True iff none of the action keywords matched at all
+                      (the silent [0.5,0,0] default -> class-(c) parse failure)
+    """
+    t = text.lower()
+    if "turn left" in t:
+        if "45" in t:
+            return [0.0, 0.0, np.pi/6.0], 1.5, {"action": "turn_left", "mag_matched": True, "fallthrough": False}
+        elif "30" in t:
+            return [0.0, 0.0, np.pi/6.0], 1.0, {"action": "turn_left", "mag_matched": True, "fallthrough": False}
+        elif "15" in t:
+            return [0.0, 0.0, np.pi/6.0], 0.5, {"action": "turn_left", "mag_matched": True, "fallthrough": False}
+        return [0.0, 0.0, np.pi/6.0], 0.5, {"action": "turn_left", "mag_matched": False, "fallthrough": False}
+    elif "turn right" in t:
+        if "45" in t:
+            return [0.0, 0.0, -np.pi/6.0], 1.5, {"action": "turn_right", "mag_matched": True, "fallthrough": False}
+        elif "30" in t:
+            return [0.0, 0.0, -np.pi/6.0], 1.0, {"action": "turn_right", "mag_matched": True, "fallthrough": False}
+        elif "15" in t:
+            return [0.0, 0.0, -np.pi/6.0], 0.5, {"action": "turn_right", "mag_matched": True, "fallthrough": False}
+        return [0.0, 0.0, -np.pi/6.0], 0.5, {"action": "turn_right", "mag_matched": False, "fallthrough": False}
+    elif "move forward" in t or "move" in t:
+        if "75" in t:
+            return [0.5, 0.0, 0.0], 1.5, {"action": "move_forward", "mag_matched": True, "fallthrough": False}
+        elif "50" in t:
+            return [0.5, 0.0, 0.0], 1.0, {"action": "move_forward", "mag_matched": True, "fallthrough": False}
+        elif "25" in t:
+            return [0.5, 0.0, 0.0], 0.5, {"action": "move_forward", "mag_matched": True, "fallthrough": False}
+        return [0.5, 0.0, 0.0], 0.5, {"action": "move_forward", "mag_matched": False, "fallthrough": False}
+    elif "stop" in t:
+        return [0.0, 0.0, 0.0], 0.0, {"action": "stop", "mag_matched": True, "fallthrough": False}
     else:
-        return [0.5, 0.0, 0.0], 0.5
+        # silent default: VLM said something the parser cannot map -> class-(c)
+        return [0.5, 0.0, 0.0], 0.5, {"action": "unparsed", "mag_matched": False, "fallthrough": True}
