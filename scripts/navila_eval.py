@@ -57,6 +57,16 @@ parser.add_argument("--skip_if_done", action="store_true", default=False,
                     help="Skip episodes whose measurement json already exists (for resume).")
 parser.add_argument("--precook", action="store_true", default=False,
                     help="Only build the env (cooks + caches the matterport collision mesh) then hard-exit. One-time per scene.")
+parser.add_argument("--lidar_constrain", action="store_true",
+                    help="(B-A) clip forward time-to-go by lidar fwd clearance")
+parser.add_argument("--safety_factor", type=float, default=0.7,
+                    help="(B-A) multiplier on lidar clearance for the clip")
+parser.add_argument("--loop_breaker_N", type=int, default=0,
+                    help="(B-B) N>=2 enables loop-breaker; 0 disables")
+parser.add_argument("--drift_thresh", type=float, default=0.15,
+                    help="(B-B) xy drift threshold for the loop detector (m)")
+parser.add_argument("--output_suffix", type=str, default="",
+                    help="Suffix appended to eval_results/{task}_loco_{run} dir, e.g. '_lidar_sf07'.")
 
 # RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -254,18 +264,17 @@ def sample_images_and_send_to_vlm(image_list, vlm_host, vlm_port, query):
         return response
 
 
-def _run_one_episode(episode, ep_idx):
-    """Run a single navigation episode end-to-end (env build → reset → loop → dump).
+def _setup_isaac_for_scene(first_episode):
+    """One-time per scene: parse cfg, build env, load policy.
 
-    Factored out of ``main()`` so a single process can drive many episodes
-    without paying the ~30-60s per-episode Isaac Sim cold-start + Python
-    startup + USD load.
+    Returns (env_inner, ppo_runner, policy). ``env_inner`` is the rsl-rl-wrapped
+    env BEFORE it is wrapped with VLNEnvWrapper (VLNEnvWrapper is per-episode
+    because it stores episode-specific goal info / measure manager).
     """
-
     env_cfg = parse_env_cfg(args_cli.task, num_envs=args_cli.num_envs)
 
-    # reset the position and rotation of the robot
-    env_cfg = reset_start_pos_rot(env_cfg, args_cli, episode)
+    # reset the position and rotation of the robot for the FIRST episode of this scene
+    env_cfg = reset_start_pos_rot(env_cfg, args_cli, first_episode)
 
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(
         args_cli.task, args_cli, play=True
@@ -317,11 +326,69 @@ def _run_one_episode(episode, ep_idx):
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
+    return env, ppo_runner, policy
+
+
+def _mutate_pose_for_episode(env_inner, episode):
+    """In-place mutate robot + disk markers' default_root_state to the new episode's
+    start/goal. Caller must subsequently call env.reset() so reset_root_state_uniform
+    picks up the new defaults (and clears velocities + counters).
+
+    Only valid when staying within the SAME scene (USD terrain unchanged).
+    """
+    device = env_inner.unwrapped.device
+
+    start_pos = episode["start_position"]
+    start_rot = episode["start_rotation"]  # [w, x, y, z]
+    goal_pos = episode["reference_path"][-1]
+
+    if "go2" in args_cli.task:
+        z_off = 0.4
+    elif "h1" in args_cli.task:
+        z_off = 1.0
+    else:
+        z_off = 0.5
+
+    robot = env_inner.unwrapped.scene["robot"]
+    robot.data.default_root_state[0, 0:3] = torch.tensor(
+        [start_pos[0], start_pos[1], start_pos[2] + z_off], device=device, dtype=robot.data.default_root_state.dtype
+    )
+    robot.data.default_root_state[0, 3:7] = torch.tensor(
+        [start_rot[0], start_rot[1], start_rot[2], start_rot[3]], device=device, dtype=robot.data.default_root_state.dtype
+    )
+    robot.data.default_root_state[0, 7:13] = 0.0
+
+    # disk_1 / disk_2 are AssetBaseCfg XformPrims (visual markers, no physics)
+    # — they don't have .data.default_root_state. They're only used for the
+    # video overlay. Visually wrong for ep 2+ in scene-batch, but doesn't
+    # affect benchmark correctness (success / d2g use episode["reference_path"]
+    # directly). Skipping mutation is OK.
+
+
+def _run_episode_inner(env_inner, ppo_runner, policy, episode, ep_idx, is_first):
+    """Run a single episode using an already-built (env_inner, policy).
+
+    For is_first=False, mutate default_root_state to the new episode's start
+    before reset; the wrapper's reset_root_state_uniform then teleports the
+    robot + markers via the new defaults.
+
+    Does NOT call env.close() — the env outlives the episode (lifetime = scene).
+    """
+    # Wrap the inner env with a fresh VLNEnvWrapper for THIS episode (carries
+    # measure manager + goal info bound to this episode).
     all_measures = ["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess", "CollisionRate", "TerminationReason", "ObstacleClearance"]
-    env = VLNEnvWrapper(env, policy, args_cli.task, episode, high_level_obs_key="camera_obs",
+    env = VLNEnvWrapper(env_inner, policy, args_cli.task, episode, high_level_obs_key="camera_obs",
                         measure_names=all_measures)
-    
-    # set view pos and target
+
+    if not is_first:
+        # Same scene, different episode: mutate scene-default root states so
+        # the upcoming reset teleports robot + disk markers to the new pose.
+        _mutate_pose_for_episode(env_inner, episode)
+
+    # step with zeros actions to get the initial frame
+    obs, infos = env.reset()
+
+    # set view pos and target (per-episode because robot pose changes per ep)
     robot_pos_w = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
     robot_quat_w = env.unwrapped.scene["robot"].data.root_quat_w[0].detach().cpu().numpy()
     roll, pitch, yaw = quat2eulers(robot_quat_w[0], robot_quat_w[1], robot_quat_w[2], robot_quat_w[3])
@@ -329,9 +396,6 @@ def _run_one_episode(episode, ep_idx):
     cam_target = (robot_pos_w[0], robot_pos_w[1], robot_pos_w[2])
     # set the camera view
     env.unwrapped.sim.set_camera_view(eye=cam_eye, target=cam_target)
-    
-    # step with zeros actions to get the initial frame
-    obs, infos = env.reset()
 
     if args_cli.precook:
         # env build + reset has triggered & completed the matterport collision
@@ -373,14 +437,55 @@ def _run_one_episode(episode, ep_idx):
     broke_by = "running"
     parse_info = {"action": "none", "mag_matched": False, "fallthrough": False}
 
+    # Problem B interventions (decode-time, embodiment-aware).
+    # Import once per episode (cheap), only used when flags enabled.
+    if args_cli.loop_breaker_N >= 2 or args_cli.lidar_constrain:
+        import sys as _sys
+        _sys.path.insert(0, os.path.dirname(__file__))
+        from _inline_intervention_patch import LoopBreaker, lidar_constrain_command
+        loop_breaker = LoopBreaker(N=args_cli.loop_breaker_N or 999,
+                                   drift_thresh_m=args_cli.drift_thresh)
+    else:
+        loop_breaker = None
+
+    # Profiling counters. Print as one line at episode end via [prof]. Cheap
+    # — only adds 6 perf_counter calls per iter + 1 final print.
+    _PROF = os.environ.get("NAVILA_PROF") == "1"
+    if _PROF:
+        _t_step = 0.0   # env.step()
+        _t_vlm = 0.0    # sample_images_and_send_to_vlm
+        _t_cap = 0.0    # camera frame capture (image_observations + viz)
+        _t_traj = 0.0   # per-step traj sample (post-step)
+        _t_stuck = 0.0  # same-pos check
+        _t_loop_start = time.perf_counter()
+
     # visualizer = define_markers()
     # simulate environment
     while simulation_app.is_running():
         # run everything in inference mode
         with torch.inference_mode():
             if num_steps == target_steps:
+                _t0 = time.perf_counter() if _PROF else 0
                 stream_output = sample_images_and_send_to_vlm(image_observations, args_cli.vlm_host, args_cli.vlm_port, instruction.instruction_text)
+                if _PROF: _t_vlm += time.perf_counter() - _t0
                 vlm_vel_commands, time_to_go, parse_info = get_vel_command(stream_output)
+
+                # (B-B) loop-breaker: override stuck VLM output before clip
+                if args_cli.loop_breaker_N >= 2 and loop_breaker is not None:
+                    _rp_now = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
+                    trig, ov_vel, ov_ttg = loop_breaker.step(stream_output, (_rp_now[0], _rp_now[1]))
+                    if trig:
+                        vlm_vel_commands, time_to_go = ov_vel, ov_ttg
+                        parse_info = dict(parse_info, loop_breaker_fired=True)
+
+                # (B-A) lidar-constrained clip for forward commands
+                if args_cli.lidar_constrain:
+                    vlm_vel_commands, time_to_go, parse_info, clip_meta = lidar_constrain_command(
+                        stream_output, vlm_vel_commands, time_to_go, parse_info, env,
+                        safety_factor=args_cli.safety_factor,
+                    )
+                    parse_info = dict(parse_info, clip=clip_meta)
+
                 env_steps_to_go = int(time_to_go / (
                     env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation
                 ))
@@ -408,39 +513,54 @@ def _run_one_episode(episode, ep_idx):
                     "n_frames_avail": len(image_observations),  # frames the VLM saw this call
                 })
 
+        _t0 = time.perf_counter() if _PROF else 0
         obs, _, done, infos = env.step(torch.tensor(vlm_vel_commands, device = obs.device))
+        if _PROF: _t_step += time.perf_counter() - _t0
 
         # per-step trajectory sample (cheap; lets any future metric be recomputed offline)
-        _p = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
-        _q = env.unwrapped.scene["robot"].data.root_quat_w[0].detach().cpu().numpy()
-        _, _, _y = quat2eulers(_q[0], _q[1], _q[2], _q[3])
-        _m = infos.get("measurements", {}) if isinstance(infos, dict) else {}
-        traj.append([int(num_steps), float(_p[0]), float(_p[1]), float(_p[2]),
-                     float(_y), float(_m.get("distance_to_goal", -1.0))])
-        # full proprioceptive state per step (arbiter inputs / dynamics analysis)
-        try:
-            _rd = env.unwrapped.scene["robot"].data
-            _row = np.concatenate([
-                np.array([int(num_steps)], dtype=np.float32),
-                _q.astype(np.float32),                                            # root quat w,x,y,z (4)
-                _rd.root_lin_vel_b[0].detach().cpu().numpy().astype(np.float32),   # base lin vel xyz (3)
-                _rd.root_ang_vel_b[0].detach().cpu().numpy().astype(np.float32),   # base ang vel xyz (3)
-                _rd.joint_pos[0].detach().cpu().numpy().astype(np.float32),        # joint pos (12)
-                _rd.joint_vel[0].detach().cpu().numpy().astype(np.float32),        # joint vel (12)
-            ])
+        # Sample at most every 5 steps to cut GPU→CPU sync overhead (~14 syncs/step).
+        # vlm-call events are still recorded separately via trace_events.
+        # `done` may be a scalar Python bool (from VLNEnvWrapper) or a tensor.
+        _t0 = time.perf_counter() if _PROF else 0
+        _done_flag = bool(done.any().item()) if hasattr(done, "any") else bool(done)
+        if (int(num_steps) % 5 == 0) or _done_flag:
+            _p = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
+            _q = env.unwrapped.scene["robot"].data.root_quat_w[0].detach().cpu().numpy()
+            _, _, _y = quat2eulers(_q[0], _q[1], _q[2], _q[3])
+            _m = infos.get("measurements", {}) if isinstance(infos, dict) else {}
+            traj.append([int(num_steps), float(_p[0]), float(_p[1]), float(_p[2]),
+                         float(_y), float(_m.get("distance_to_goal", -1.0))])
+        # NOTE: per-step proprio dump removed — was ~14 GPU→CPU syncs/step × 1400 steps
+        # = 20k syncs/ep. None of our current metrics use it; can be re-enabled by
+        # setting NAVILA_DUMP_PROPRIO=1.
+        if os.environ.get("NAVILA_DUMP_PROPRIO") == "1":
             try:
-                _cf = env.unwrapped.scene.sensors["contact_forces"].data.net_forces_w[0]
-                _row = np.concatenate([_row, _cf.norm(dim=-1).detach().cpu().numpy().astype(np.float32)])  # per-body |contact|
+                _rd = env.unwrapped.scene["robot"].data
+                _q = env.unwrapped.scene["robot"].data.root_quat_w[0].detach().cpu().numpy()
+                _row = np.concatenate([
+                    np.array([int(num_steps)], dtype=np.float32),
+                    _q.astype(np.float32),
+                    _rd.root_lin_vel_b[0].detach().cpu().numpy().astype(np.float32),
+                    _rd.root_ang_vel_b[0].detach().cpu().numpy().astype(np.float32),
+                    _rd.joint_pos[0].detach().cpu().numpy().astype(np.float32),
+                    _rd.joint_vel[0].detach().cpu().numpy().astype(np.float32),
+                ])
+                try:
+                    _cf = env.unwrapped.scene.sensors["contact_forces"].data.net_forces_w[0]
+                    _row = np.concatenate([_row, _cf.norm(dim=-1).detach().cpu().numpy().astype(np.float32)])
+                except Exception:
+                    pass
+                proprio.append(_row)
             except Exception:
                 pass
-            proprio.append(_row)
-        except Exception:
-            pass
+
+        if _PROF: _t_traj += time.perf_counter() - _t0
 
         if done or env.is_stop_called or num_steps > max_episode_steps:
             broke_by = "done" if done else ("stop" if env.is_stop_called else "maxsteps")
             break
 
+        _t0 = time.perf_counter() if _PROF else 0
         cur_pos = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
         robot_vel = np.linalg.norm(env.unwrapped.scene["robot"].data.root_vel_w[0].detach().cpu().numpy())
         if np.linalg.norm(cur_pos - prev_pos) < 0.01 and robot_vel < 0.01:
@@ -448,6 +568,7 @@ def _run_one_episode(episode, ep_idx):
         else:
             same_pos_count = 0
         prev_pos = cur_pos
+        if _PROF: _t_stuck += time.perf_counter() - _t0
 
         # Break out of the loop if the robot has stayed in the same location for 500 steps
         if same_pos_count >= 1000:
@@ -455,6 +576,7 @@ def _run_one_episode(episode, ep_idx):
             broke_by = "stuck"
             break
 
+        _t0 = time.perf_counter() if _PROF else 0
         if num_steps % steps_per_image == 0:
             curr_frame = infos["observations"]["camera_obs"][0, :, :, :3].cpu().numpy()
             image_observations.append(Image.fromarray(curr_frame))
@@ -465,6 +587,7 @@ def _run_one_episode(episode, ep_idx):
             curr_vis_frame = infos["observations"]["viz_camera_obs"][0, :, :, :3].cpu().numpy()
             add_instruction_on_img(curr_vis_frame, stream_output)
             rgb_obses.append(np.concatenate([curr_frame_copy, curr_vis_frame], axis=1))
+        if _PROF: _t_cap += time.perf_counter() - _t0
 
         num_steps += 1
         if env_steps_to_go == 0:
@@ -472,6 +595,18 @@ def _run_one_episode(episode, ep_idx):
 
         # if args_cli.visualize_path:
         #     visualizer.visualize(reference_path_isaac)
+
+    if _PROF:
+        _wall = time.perf_counter() - _t_loop_start
+        _other = _wall - _t_step - _t_vlm - _t_cap - _t_traj - _t_stuck
+        print(f"[prof] ep_idx={ep_idx} steps={num_steps} vlm_calls={n_vlm_calls} "
+              f"wall={_wall:.1f}s | step={_t_step:.1f}s ({100*_t_step/_wall:.0f}%) "
+              f"vlm={_t_vlm:.1f}s ({100*_t_vlm/_wall:.0f}%) "
+              f"cap={_t_cap:.1f}s ({100*_t_cap/_wall:.0f}%) "
+              f"traj={_t_traj:.1f}s ({100*_t_traj/_wall:.0f}%) "
+              f"stuck={_t_stuck:.1f}s ({100*_t_stuck/_wall:.0f}%) "
+              f"other={_other:.1f}s ({100*_other/_wall:.0f}%)", flush=True)
+
     measurements = infos["measurements"]
     # parse-failure stats into the lightweight summary (class-(c) signal + IPSR)
     measurements["n_vlm_calls"] = int(n_vlm_calls)
@@ -479,7 +614,7 @@ def _run_one_episode(episode, ep_idx):
     measurements["parse_fail_rate"] = (n_parse_fall / n_vlm_calls) if n_vlm_calls else 0.0
     measurements["broke_by"] = broke_by
 
-    result_dir = f"eval_results/{args_cli.task}_loco_{args_cli.load_run}"
+    result_dir = f"eval_results/{args_cli.task}_loco_{args_cli.load_run}{args_cli.output_suffix}"
     if not os.path.exists(result_dir):
         os.makedirs(result_dir)
 
@@ -548,45 +683,63 @@ def _run_one_episode(episode, ep_idx):
             for _i, _r in enumerate(proprio):
                 _pr[_i, :len(_r)] = _r
             _npz["proprio"] = _pr
-        np.savez_compressed(os.path.join(trace_dir, f"{eid}.npz"), **_npz)
+        # NaN-padded npz can be a few MB on shared disk; default uncompressed
+        # savez is ~3-5x faster on NFS for medium tensors. Toggle compression
+        # back on with NAVILA_TRACE_COMPRESS=1.
+        if os.environ.get("NAVILA_TRACE_COMPRESS") == "1":
+            np.savez_compressed(os.path.join(trace_dir, f"{eid}.npz"), **_npz)
+        else:
+            np.savez(os.path.join(trace_dir, f"{eid}.npz"), **_npz)
     # exact frames fed to the VLM over the episode (JPEG, ~30KB ea) so every
-    # VLM input can be reconstructed offline without re-running Isaac
-    try:
-        import io
-        _buf = []
-        for _im in image_observations:
-            _b = io.BytesIO(); _im.save(_b, format="JPEG", quality=85)
-            _buf.append(np.frombuffer(_b.getvalue(), dtype=np.uint8))
-        np.savez_compressed(
-            os.path.join(trace_dir, f"{eid}_frames.npz"),
-            frames=np.array(_buf, dtype=object),
-        )
-    except Exception as _e:
-        print(f"[trace] frame dump skipped: {_e}")
+    # VLM input can be reconstructed offline without re-running Isaac.
+    # Heavy: ~5-15s/ep on shared disk. Defaults to OFF to keep the benchmark
+    # dispatch fast; opt-in with NAVILA_DUMP_FRAMES=1 if the npz is needed.
+    if os.environ.get("NAVILA_DUMP_FRAMES") == "1":
+        try:
+            import io
+            _buf = []
+            for _im in image_observations:
+                _b = io.BytesIO(); _im.save(_b, format="JPEG", quality=85)
+                _buf.append(np.frombuffer(_b.getvalue(), dtype=np.uint8))
+            np.savez(
+                os.path.join(trace_dir, f"{eid}_frames.npz"),
+                frames=np.array(_buf, dtype=object),
+            )
+        except Exception as _e:
+            print(f"[trace] frame dump skipped: {_e}")
 
 
-    video_dir = os.path.join(result_dir, "videos")
-    if not os.path.exists(video_dir):
-        os.makedirs(video_dir)
+    # MP4 video write — heavy H264 encode of ~280 1024×512 frames (~3-5s/ep).
+    # Defaults to OFF for the benchmark dispatch; opt-in with NAVILA_WRITE_VIDEO=1.
+    if os.environ.get("NAVILA_WRITE_VIDEO") == "1":
+        video_dir = os.path.join(result_dir, "videos")
+        if not os.path.exists(video_dir):
+            os.makedirs(video_dir)
 
-    writer = imageio.get_writer(f"{video_dir}/output_{int(episode['episode_id'])-1}.mp4", fps=10)
-    for frame in rgb_obses:
-        frame = frame.astype(np.uint8)
-        writer.append_data(frame)
+        writer = imageio.get_writer(f"{video_dir}/output_{int(episode['episode_id'])-1}.mp4", fps=10)
+        for frame in rgb_obses:
+            frame = frame.astype(np.uint8)
+            writer.append_data(frame)
 
-    writer.close()
+        writer.close()
 
-    # close the simulator
-    env.close()
+    # NOTE: do NOT call env.close() here — env_inner is reused across episodes
+    # within the same scene. Cleanup happens via simulation_app.close() at
+    # process exit (one process per scene; see main()).
 
 
 def main():
     """Drive one or many episodes in a single Isaac Sim process.
 
     --episode_idx_list "i,j,k,..." lets one navila_eval process run a batch of
-    episodes, paying the Isaac Sim cold-start cost only once (vs. once per
-    episode in the old per-ep subprocess model). With --skip_if_done, we resume
-    by skipping ep indices whose measurement json already exists.
+    episodes from the SAME SCENE, paying the Isaac Sim cold-start + USD load
+    cost only ONCE (vs. once per episode). Cross-scene batching is NOT
+    supported in-process (matterport USD cannot be hot-swapped, and isaac's
+    gym.make hangs on second invocation in the same Python process) — the
+    caller (run_benchmark.py) must dispatch one subprocess per scene.
+
+    With --skip_if_done, episodes whose measurement json already exists are
+    skipped (resume).
     """
     import traceback as _tb
     r2r_data_path = os.path.join(ASSETS_DIR, "vln_ce_isaac_v1.json.gz")
@@ -597,29 +750,63 @@ def main():
     else:
         ep_indices = [args_cli.episode_idx]
 
-    # Resolve result_dir for resume-skip (matches the path used inside _run_one_episode).
+    # Resolve result_dir for resume-skip (matches the path used inside _run_episode_inner).
     result_dir = os.path.join(os.path.dirname(__file__), "..",
-                              f"eval_results/{args_cli.task}_loco_{args_cli.load_run}")
+                              f"eval_results/{args_cli.task}_loco_{args_cli.load_run}{args_cli.output_suffix}")
     measurement_dir = os.path.join(result_dir, "measurements")
 
-    print(f"[batch] driving {len(ep_indices)} episodes in this process", flush=True)
+    # Filter to-run set (after skip_if_done).
+    todo = []
     for i, ep_idx in enumerate(ep_indices):
         if args_cli.skip_if_done:
             eid = int(all_episodes[ep_idx]['episode_id']) - 1
             if os.path.exists(f"{measurement_dir}/{eid}.json"):
                 print(f"[batch] ({i+1}/{len(ep_indices)}) ep_idx={ep_idx} eid={eid}: SKIP (done)", flush=True)
                 continue
-        print(f"[batch] ({i+1}/{len(ep_indices)}) ep_idx={ep_idx}: START", flush=True)
+        todo.append(ep_idx)
+
+    if not todo:
+        print("[batch] nothing to run (all skipped).", flush=True)
+        return
+
+    # Sanity-check: all eps in todo must share scene_id (run_benchmark.py groups
+    # by scene before dispatching; in-process scene swap is not supported).
+    def _sid(ep):
+        return os.path.splitext(os.path.basename(ep["scene_id"]))[0]
+    first_sid = _sid(all_episodes[todo[0]])
+    for ep_idx in todo[1:]:
+        s = _sid(all_episodes[ep_idx])
+        if s != first_sid:
+            print(f"[batch] ABORT: mixed scene_ids in one process "
+                  f"(first={first_sid}, ep_idx={ep_idx}->{s}). "
+                  f"Dispatch must group by scene.", flush=True)
+            return
+
+    print(f"[batch] scene={first_sid}: driving {len(todo)} episodes in this process "
+          f"(of {len(ep_indices)} requested)", flush=True)
+
+    # One-time scene setup (gym.make + policy load) using FIRST episode's pose.
+    env_inner, ppo_runner, policy = _setup_isaac_for_scene(all_episodes[todo[0]])
+
+    for i, ep_idx in enumerate(todo):
+        is_first = (i == 0)
+        print(f"[batch] ({i+1}/{len(todo)}) ep_idx={ep_idx}: START", flush=True)
         try:
-            _run_one_episode(all_episodes[ep_idx], ep_idx)
+            _run_episode_inner(env_inner, ppo_runner, policy,
+                               all_episodes[ep_idx], ep_idx, is_first=is_first)
         except Exception:
             print(f"[batch] ep_idx={ep_idx}: FAILED", flush=True)
             _tb.print_exc()
+            # Continue to next ep — env_inner is still alive; the wrapper
+            # construction was the only per-ep mutable state.
     print(f"[batch] all done.", flush=True)
+    # env_inner is NOT closed — simulation_app.close() at process exit will
+    # handle Isaac shutdown.
 
 
 if __name__ == "__main__":
-    # run the main function
-    main()
-    # close sim app
-    simulation_app.close()
+    try:
+        main()
+    finally:
+        import os as _os
+        _os._exit(0)

@@ -140,9 +140,35 @@ class MatterportImporter(TerrainImporter):
             "Please use the async function to convert the obj file to usd first (accessed over the extension in the GUI)"
         )
 
-        self._xform_prim = prim_utils.create_prim(
-            prim_path=self.cfg.prim_path + "/Matterport", translation=(0.0, 0.0, 0.0), usd_path=base_path + ".usd"
-        )
+        # Multi-env: create one matterport prim per env at the env's spatial
+        # origin. With env_spacing large (e.g. 100) the envs are physically far
+        # apart in world space so cameras can't see across, and each env's
+        # robot can be placed at its episode's start_pos relative to the env's
+        # own matterport copy.
+        num_envs = int(getattr(self.cfg, "num_envs", 1) or 1)
+        # env_origins is filled in by configure_env_origins() during base init.
+        # If we run before that, fall back to a single-env layout.
+        env_origins = getattr(self, "env_origins", None)
+        if env_origins is None or num_envs <= 1:
+            self._xform_prim = prim_utils.create_prim(
+                prim_path=self.cfg.prim_path + "/Matterport",
+                translation=(0.0, 0.0, 0.0),
+                usd_path=base_path + ".usd",
+            )
+            self._env_matterport_prims = [self._xform_prim]
+        else:
+            self._env_matterport_prims = []
+            origins_cpu = env_origins.detach().cpu().numpy().tolist()
+            for env_id in range(num_envs):
+                ox, oy, oz = origins_cpu[env_id]
+                prim_path = f"/World/envs/env_{env_id}/Matterport"
+                p = prim_utils.create_prim(
+                    prim_path=prim_path,
+                    translation=(float(ox), float(oy), float(oz)),
+                    usd_path=base_path + ".usd",
+                )
+                self._env_matterport_prims.append(p)
+            self._xform_prim = self._env_matterport_prims[0]
 
         # No PhysX collider on the matterport mesh: the building USDs have zero
         # pre-authored collision and PhysX cold-cooking the exact triangle mesh
@@ -155,7 +181,8 @@ class MatterportImporter(TerrainImporter):
         physics_material_cfg: sim_utils.RigidBodyMaterialCfg = self.cfg.physics_material
         # spawn the material
         physics_material_cfg.func(f"{self.cfg.prim_path}/physicsMaterial", self.cfg.physics_material)
-        sim_utils.bind_physics_material(self._xform_prim.GetPrimPath(), f"{self.cfg.prim_path}/physicsMaterial")
+        for _p in self._env_matterport_prims:
+            sim_utils.bind_physics_material(_p.GetPrimPath(), f"{self.cfg.prim_path}/physicsMaterial")
 
         # add colliders and physics material
         if self.cfg.groundplane:
@@ -163,3 +190,42 @@ class MatterportImporter(TerrainImporter):
             ground_plane = ground_plane_cfg.func("/World/GroundPlane", ground_plane_cfg)
             ground_plane.visible = False
         return
+
+    def swap_matterport(self, new_obj_filepath: str) -> None:
+        """Hot-swap the matterport USD without restarting Isaac Sim.
+
+        Mutates each per-env matterport prim's USD reference to the new file.
+        InteractiveScene cloning means each env has its OWN prim instance, so
+        we iterate all per-env prim paths and update each's USD reference.
+
+        NOTE: caller must reset the env after this to flush physics state.
+        """
+        from pxr import Sdf
+        import isaacsim.core.utils.stage as _stage_u
+        stage = _stage_u.get_current_stage()
+        base_path, _ = os.path.splitext(new_obj_filepath)
+        new_usd = base_path + ".usd"
+        assert os.path.exists(new_usd), f"swap: USD missing {new_usd}"
+        self.cfg.obj_filepath = new_obj_filepath
+        num_envs = int(getattr(self.cfg, "num_envs", 1) or 1)
+        # Stage probe says only /World/matterport/Matterport exists (no per-env
+        # clones). Try both layouts in order; the one that's actually present wins.
+        candidate_paths = [self.cfg.prim_path + "/Matterport"]
+        if num_envs > 1:
+            for env_id in range(num_envs):
+                candidate_paths.append(f"/World/envs/env_{env_id}/Matterport")
+        n_swapped = 0
+        for pp in candidate_paths:
+            prim = stage.GetPrimAtPath(pp)
+            if not prim.IsValid():
+                print(f"[matterport.swap] prim missing: {pp}", flush=True)
+                continue
+            refs = prim.GetReferences()
+            refs.ClearReferences()
+            refs.AddReference(new_usd)
+            n_swapped += 1
+        sim = SimulationContext.instance()
+        if sim is not None and sim.app is not None:
+            for _ in range(3):
+                sim.app.update()
+        print(f"[matterport.swap] {n_swapped}/{len(candidate_paths)} envs -> {os.path.basename(base_path)}", flush=True)

@@ -369,7 +369,14 @@ class Go2MatterportBaseCfg(ManagerBasedRLEnvCfg):
         """Post initialization."""
         # general settings
         self.decimation = 4  # 4->50 Hz
-        self.sim.render_interval = 4
+        # render_interval is in PHYSICS SUBSTEPS. With decimation=4, render
+        # every 4 substeps = every control step. The VLM only samples the
+        # camera every 25 control steps (steps_per_image=25), and viz video
+        # is opt-in (NAVILA_WRITE_VIDEO=1). Bumping to 100 means render once
+        # per 25 control steps — exactly when sampled — cutting ~96% of the
+        # camera render cost. Profiling on volc3 showed env.step was 56% of
+        # episode wall time, mostly camera render at 512x512 RGB+depth.
+        self.sim.render_interval = 100
         self.episode_length_s = 200000.0
         # simulation settings
         self.sim.dt = 0.005

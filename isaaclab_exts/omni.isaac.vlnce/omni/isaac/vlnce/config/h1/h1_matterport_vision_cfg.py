@@ -280,7 +280,7 @@ class TerrainSceneCfg(InteractiveSceneCfg):
             dynamic_friction=1.0,
         ),
         obj_filepath=os.path.join(ASSETS_DIR, "matterport_usd/5q7pvUzZiYa/5q7pvUzZiYa.usd"),
-        groundplane=False,
+        groundplane=True,
     )
 
     # robots
@@ -367,7 +367,9 @@ class H1MatterportVisionCfg(ManagerBasedRLEnvCfg):
         self.decimation = 4  # 20->10 Hz, 4->50 Hz
         self.episode_length_s = 200000.0
         # simulation settings
-        self.sim.render_interval = 4
+        # render_interval bumped 4→100 (align with VLM sample period). Cuts
+        # ~96% camera render cost; doesn't degrade VLM input freshness.
+        self.sim.render_interval = 100
         self.sim.dt = 0.005
         self.sim.disable_contact_processing = True
         self.sim.physics_material.static_friction = 1.0

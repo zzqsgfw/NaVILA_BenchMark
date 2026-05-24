@@ -27,6 +27,17 @@ if __name__ == "__main__":
     parser.add_argument("--no-resume", dest="resume", action="store_false")
     parser.add_argument("--vlm-port", type=int, default=54321,
                         help="Port of the VLM server to forward to navila_eval (per-shard distinct port for multi-GPU).")
+    parser.add_argument("--lidar_constrain", action="store_true",
+                        help="(B-A) forward to navila_eval: lidar-feasibility decode clip")
+    parser.add_argument("--safety_factor", type=float, default=0.7)
+    parser.add_argument("--loop_breaker_N", type=int, default=0,
+                        help="(B-B) forward to navila_eval: 0 disables")
+    parser.add_argument("--drift_thresh", type=float, default=0.15)
+    parser.add_argument("--output_suffix", type=str, default="",
+                        help="Suffix appended to eval_results dir to keep ablations separate from baseline.")
+    parser.add_argument("--multi_env_n", type=int, default=1,
+                        help="If >1, dispatch via navila_eval_multi.py with this num_envs per call. "
+                             "Scene groups larger than N are sliced into multiple N-batches.")
     args = parser.parse_args()
 
     # Define the arguments for evaluation
@@ -48,24 +59,65 @@ if __name__ == "__main__":
     end_idx = len(episodes) if args.end_idx < 0 else min(args.end_idx, len(episodes))
     # navila_eval writes measurements here; file name = episode_id - 1
     measurement_dir = os.path.join(
-        f"eval_results/{args.task}_loco_{args.low_level_policy_dir}", "measurements"
+        f"eval_results/{args.task}_loco_{args.low_level_policy_dir}{args.output_suffix}", "measurements"
     )
 
-    # NOTE: tried single-process batch (--episode_idx_list) but Isaac Sim
-    # `gym.make` hangs the second time it's called in the same process (known
-    # Omniverse limitation: stage swap leaks). Reverted to per-ep subprocess.
-    # Per-ep navila_eval still picks up any in-file optimizations on each spawn.
-    n_done = n_run = 0
+    # Within-scene episode batching: one subprocess per UNIQUE scene_id in the
+    # shard range, driving all to-do episodes for that scene via
+    # --episode_idx_list. This amortizes the ~30-60s Isaac Sim cold-start +
+    # USD load over all eps in the scene (avg ~24 eps/scene over the full
+    # 1077-ep benchmark, 11 unique scenes). Cross-scene cannot share an Isaac
+    # process (matterport USD can't be hot-swapped + Isaac's gym.make hangs
+    # on second call in the same Python process), hence one subprocess per
+    # scene rather than one per ep.
+    def _scene_id(ep):
+        return os.path.splitext(os.path.basename(ep["scene_id"]))[0]
+
+    # Build ordered groups: dict preserving insertion order from sequential
+    # iteration over [start_idx, end_idx). Preserves contiguous-scene locality
+    # already present in the dataset.
+    groups = {}  # scene_id -> list of ep_idx
+    n_done = 0
     for i in range(args.start_idx, end_idx):
         episode = episodes[i]
         result_json = os.path.join(measurement_dir, f"{int(episode['episode_id']) - 1}.json")
         if args.resume and os.path.exists(result_json):
             n_done += 1
             continue
+        sid = _scene_id(episode)
+        groups.setdefault(sid, []).append(i)
 
-        per_ep_args = eval_args + [f"--episode_idx={i}", f"--vlm_port={args.vlm_port}"]
-        subprocess.run(['python', 'scripts/navila_eval.py'] + per_ep_args)
-        n_run += 1
+    n_run = 0
+    n_groups_run = 0
+    use_multi = args.multi_env_n > 1
+    target_script = 'scripts/navila_eval_multi.py' if use_multi else 'scripts/navila_eval.py'
 
-    print(f"\n[run_benchmark] done. ran {n_run}, skipped {n_done} already-complete, "
-          f"range [{args.start_idx},{end_idx}).", flush=True)
+    for sid, ep_list in groups.items():
+        # Slice this scene's eps into chunks of multi_env_n (or single list if multi_env=1)
+        chunk_size = args.multi_env_n if use_multi else len(ep_list)
+        chunks = [ep_list[i:i+chunk_size] for i in range(0, len(ep_list), chunk_size)]
+        for chunk in chunks:
+            idx_list = ",".join(str(x) for x in chunk)
+            per_scene_args = eval_args + [
+                f"--episode_idx_list={idx_list}",
+                f"--vlm_port={args.vlm_port}",
+                f"--output_suffix={args.output_suffix}",
+                f"--safety_factor={args.safety_factor}",
+                f"--loop_breaker_N={args.loop_breaker_N}",
+                f"--drift_thresh={args.drift_thresh}",
+            ]
+            if use_multi:
+                # multi-env script needs explicit --num_envs matching chunk size
+                per_scene_args.append(f"--num_envs={len(chunk)}")
+            if args.lidar_constrain:
+                per_scene_args.append("--lidar_constrain")
+            if args.resume:
+                per_scene_args.append("--skip_if_done")
+            print(f"[run_benchmark] scene={sid} chunk={len(chunk)}: dispatching via {target_script}",
+                  flush=True)
+            subprocess.run(['python', target_script] + per_scene_args)
+            n_run += len(chunk)
+        n_groups_run += 1
+
+    print(f"\n[run_benchmark] done. ran {n_run} episodes across {n_groups_run} scene-groups, "
+          f"skipped {n_done} already-complete, range [{args.start_idx},{end_idx}).", flush=True)
