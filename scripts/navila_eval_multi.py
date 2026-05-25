@@ -10,11 +10,12 @@ Run via:
 
 Notes:
   * All episodes in --episode_idx_list MUST share the same scene_id (loader
-    builds ONE matterport USD per env at env_origin offset).
-  * env_spacing is forced to 100 m so per-env cameras can't see across.
-  * Robot/disk init positions are kept absolute (episode coords); IsaacLab
-    automatically adds env_origin to every env's prim, so each env's robot
-    spawns inside its own matterport copy at the episode's true start_pos.
+    builds ONE matterport USD at /World/matterport, shared by all envs).
+  * env_spacing=0: matterport mesh is NOT cloned per env. All envs occupy the
+    same world origin and each env's robot is written to its episode's
+    start_position inside the shared matterport. Cameras/lidars on different
+    robots see different POVs because robots sit at different ep start_pos in
+    the scene. Robots may collide if two eps spawn near each other (rare).
   * VLM is loaded in-process; no socket. Each VLM tick batches up to N
     parallel image_lists.
 """
@@ -50,7 +51,11 @@ parser.add_argument("--drift_thresh", type=float, default=0.15)
 parser.add_argument("--vlm_model_path", type=str,
                     default="/wuji-vefps-D/wuji-rl/zzq_ws/navila_ws/checkpoints/navila-llama3-8b-8f")
 parser.add_argument("--max_steps_per_ep", type=int, default=2500)
-parser.add_argument("--env_spacing", type=float, default=100.0)
+parser.add_argument("--env_spacing", type=float, default=0.0,
+                    help="0.0 = all envs share /World/matterport at origin, "
+                         "robots placed at their ep start_pos in the same mesh. "
+                         "Non-zero displaces envs in world space but only env_0 "
+                         "sees matterport (mesh not cloned per env).")
 cli_args.add_rsl_rl_args(parser)
 from isaaclab.app import AppLauncher
 AppLauncher.add_app_launcher_args(parser)
@@ -555,6 +560,16 @@ def main():
             t_sw = time.perf_counter()
             new_path = os.path.join(ASSETS_DIR, f"matterport_usd/{sid}/{sid}.usd")
             env_w.unwrapped.scene.terrain.swap_matterport(new_path)
+            # CRITICAL: refresh per-sensor warp mesh caches so RayCasters
+            # (especially Go2-Vision head lidar) re-read the new scene mesh.
+            try:
+                from omni.isaac.matterport.domains.matterport_importer import refresh_ray_caster_meshes as _refresh
+                t = env_w.unwrapped.scene.terrain
+                paths = [t.cfg.prim_path + "/Matterport"]
+                n_refresh = _refresh(env_w.unwrapped.scene, paths)
+                print(f"[multi] refreshed {n_refresh} stale ray_caster mesh entries", flush=True)
+            except Exception as _e:
+                print(f"[multi] WARN: ray_caster refresh failed: {_e!r}", flush=True)
             cur_scene = sid
             print(f"[multi] swap to {sid} in {time.perf_counter()-t_sw:.1f}s", flush=True)
         print(f"[multi] chunk {chunk_idx+1}/{len(scene_chunks)} scene={sid} real_n={real_n}", flush=True)

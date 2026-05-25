@@ -89,15 +89,42 @@ if __name__ == "__main__":
 
     n_run = 0
     n_groups_run = 0
-    use_multi = args.multi_env_n > 1
+    # navila_eval_multi.py supports num_envs=1 (in-process VLM + hot-swap),
+    # which is what we want even for N=1 to avoid per-scene VLM reload. The
+    # old single-env navila_eval.py path uses TCP VLM server only.
+    use_multi = args.multi_env_n >= 1
     target_script = 'scripts/navila_eval_multi.py' if use_multi else 'scripts/navila_eval.py'
 
-    for sid, ep_list in groups.items():
-        # Slice this scene's eps into chunks of multi_env_n (or single list if multi_env=1)
-        chunk_size = args.multi_env_n if use_multi else len(ep_list)
-        chunks = [ep_list[i:i+chunk_size] for i in range(0, len(ep_list), chunk_size)]
-        for chunk in chunks:
-            idx_list = ",".join(str(x) for x in chunk)
+    if use_multi:
+        # SINGLE subprocess for the whole shard — navila_eval_multi.py groups
+        # by scene + chunks of N internally + hot-swaps matterport USD across
+        # scenes (no Isaac/VLM reload per chunk). Massive saving vs per-chunk
+        # spawn (each spawn = ~3min VLM in-process load).
+        all_eps = [i for sid, ep_list in groups.items() for i in ep_list]
+        if not all_eps:
+            print("[run_benchmark] nothing to run.", flush=True)
+        else:
+            per_args = eval_args + [
+                f"--episode_idx_list={','.join(str(x) for x in all_eps)}",
+                f"--vlm_port={args.vlm_port}",
+                f"--output_suffix={args.output_suffix}",
+                f"--safety_factor={args.safety_factor}",
+                f"--loop_breaker_N={args.loop_breaker_N}",
+                f"--drift_thresh={args.drift_thresh}",
+                f"--num_envs={args.multi_env_n}",
+            ]
+            if args.lidar_constrain:
+                per_args.append("--lidar_constrain")
+            if args.resume:
+                per_args.append("--skip_if_done")
+            print(f"[run_benchmark] multi dispatch: {len(all_eps)} eps across "
+                  f"{len(groups)} scenes (one persistent subprocess)", flush=True)
+            subprocess.run(['python', target_script] + per_args)
+            n_run = len(all_eps)
+            n_groups_run = len(groups)
+    else:
+        for sid, ep_list in groups.items():
+            idx_list = ",".join(str(x) for x in ep_list)
             per_scene_args = eval_args + [
                 f"--episode_idx_list={idx_list}",
                 f"--vlm_port={args.vlm_port}",
@@ -106,17 +133,15 @@ if __name__ == "__main__":
                 f"--loop_breaker_N={args.loop_breaker_N}",
                 f"--drift_thresh={args.drift_thresh}",
             ]
-            if use_multi:
-                # multi-env script needs explicit --num_envs matching chunk size
-                per_scene_args.append(f"--num_envs={len(chunk)}")
             if args.lidar_constrain:
                 per_scene_args.append("--lidar_constrain")
             if args.resume:
                 per_scene_args.append("--skip_if_done")
-            print(f"[run_benchmark] scene={sid} chunk={len(chunk)}: dispatching via {target_script}",
+            print(f"[run_benchmark] scene={sid}: dispatching via {target_script}",
                   flush=True)
             subprocess.run(['python', target_script] + per_scene_args)
-            n_run += len(chunk)
+            n_run += len(ep_list)
+            n_groups_run += 1
         n_groups_run += 1
 
     print(f"\n[run_benchmark] done. ran {n_run} episodes across {n_groups_run} scene-groups, "

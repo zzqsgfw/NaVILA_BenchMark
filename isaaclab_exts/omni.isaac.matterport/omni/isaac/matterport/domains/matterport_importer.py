@@ -170,12 +170,9 @@ class MatterportImporter(TerrainImporter):
                 self._env_matterport_prims.append(p)
             self._xform_prim = self._env_matterport_prims[0]
 
-        # No PhysX collider on the matterport mesh: the building USDs have zero
-        # pre-authored collision and PhysX cold-cooking the exact triangle mesh
-        # is effectively non-terminating on these scenes (>16h, still in cooker).
-        # Visual mesh is sufficient for the RayCaster lidar (RTX, no PhysX).
-        # Ground is provided by GroundPlane (set groundplane=True in cfg);
-        # base_contact termination still fires on falls.
+        # NOTE: trimesh collider experimentally added (commented out — caused
+        # robots stuck because ceiling triangles trap robot too); revert to
+        # groundplane-only baseline for now. See git history for trimesh code.
 
         # create physics material
         physics_material_cfg: sim_utils.RigidBodyMaterialCfg = self.cfg.physics_material
@@ -228,4 +225,43 @@ class MatterportImporter(TerrainImporter):
         if sim is not None and sim.app is not None:
             for _ in range(3):
                 sim.app.update()
+
         print(f"[matterport.swap] {n_swapped}/{len(candidate_paths)} envs -> {os.path.basename(base_path)}", flush=True)
+        print("[matterport.swap] NOTE: caller must also call refresh_ray_caster_meshes(scene) "
+              "to invalidate stale warp mesh caches in RayCaster sensors.", flush=True)
+
+
+def refresh_ray_caster_meshes(scene, candidate_paths: list[str]) -> int:
+    """Invalidate stale per-sensor warp mesh caches after a USD swap.
+
+    IL's RayCaster stores `self.meshes: dict[str, wp.Mesh]` per instance. After
+    swap_matterport mutates the USD reference at e.g. /World/matterport, every
+    sensor whose mesh_prim_paths matches a swapped path still holds the OLD
+    warp mesh and will ray-cast against stale geometry (Go2-Vision head lidar
+    breaks because of this). Pop matching entries and re-init each sensor.
+
+    Returns number of (sensor, path) pairs refreshed.
+    """
+    refreshed = 0
+    try:
+        sensors = getattr(scene, "sensors", None) or {}
+    except Exception:
+        return 0
+    for sensor_name, sensor in (sensors.items() if hasattr(sensors, "items") else []):
+        s_meshes = getattr(sensor, "meshes", None)
+        s_cfg = getattr(sensor, "cfg", None)
+        if s_meshes is None or s_cfg is None:
+            continue
+        s_paths = getattr(s_cfg, "mesh_prim_paths", None) or []
+        hits = [p for p in s_paths if p in s_meshes and any(c.startswith(p) for c in candidate_paths)]
+        if not hits:
+            continue
+        for p in hits:
+            s_meshes.pop(p, None)
+        if hasattr(sensor, "_initialize_warp_meshes"):
+            try:
+                sensor._initialize_warp_meshes()
+                refreshed += len(hits)
+            except Exception as _e:
+                print(f"[matterport.swap] WARN: sensor {sensor_name} re-init failed: {_e!r}", flush=True)
+    return refreshed
